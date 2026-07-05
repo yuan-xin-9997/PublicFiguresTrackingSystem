@@ -5,7 +5,7 @@ import sys
 import httpx
 
 
-BASE_URL = os.getenv("PFTS_SMOKE_URL", "http://127.0.0.1:8000")
+BASE_URL = os.getenv("PFTS_SMOKE_URL", "http://127.0.0.1:28000")
 
 
 def main() -> int:

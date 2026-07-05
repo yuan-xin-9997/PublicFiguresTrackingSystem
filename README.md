@@ -83,7 +83,7 @@ PublicFiguresTrackingSystem/
 
 ```text
 PFTS_SERVER__HOST=0.0.0.0
-PFTS_SERVER__PORT=8000
+PFTS_SERVER__PORT=28000
 PFTS_AI_API_KEY=your-secret
 PFTS_WEBFETCH_API_KEY=your-webfetch-api-key
 ```
@@ -201,7 +201,7 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Vite 会把 `/api` 代理到 `127.0.0.1:8000`。生产构建由 FastAPI 同源托管。
+Vite 会把 `/api` 代理到 `127.0.0.1:28000`。生产构建由 FastAPI 同源托管。
 
 ## 测试方式
 
@@ -258,9 +258,9 @@ Jenkins 任务应选择 “Pipeline script from SCM”，使用 SSH 仓库地址
 
 默认仅监听本机：
 
-- Web 页面：[http://127.0.0.1:8000/](http://127.0.0.1:8000/)
-- OpenAPI：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- 健康检查：[http://127.0.0.1:8000/api/v1/health/ready](http://127.0.0.1:8000/api/v1/health/ready)
+- Web 页面：[http://127.0.0.1:28000/](http://127.0.0.1:28000/)
+- OpenAPI：[http://127.0.0.1:28000/docs](http://127.0.0.1:28000/docs)
+- 健康检查：[http://127.0.0.1:28000/api/v1/health/ready](http://127.0.0.1:28000/api/v1/health/ready)
 
 若供局域网或反向代理访问，请通过环境变量把监听地址改为 `0.0.0.0`，并在防火墙、反向代理和 HTTPS 层限制访问。
 

@@ -9,7 +9,7 @@ SRC_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "app": {"name": "公开人物行程动态言论跟踪系统", "timezone": "Asia/Shanghai"},
-    "server": {"host": "127.0.0.1", "port": 8000, "base_url": ""},
+    "server": {"host": "127.0.0.1", "port": 28000, "base_url": ""},
     "database": {"path": "data/app.sqlite3", "busy_timeout_ms": 5000},
     "security": {
         "password_file": "data/password.txt",

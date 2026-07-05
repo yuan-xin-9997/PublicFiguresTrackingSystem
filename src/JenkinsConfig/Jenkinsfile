@@ -50,7 +50,7 @@ pipeline {
                     JENKINS_NODE_COOKIE=dontKillMe "$DEPLOY_DIR/start.sh"
                     sleep 3
                     "$DEPLOY_DIR/status.sh"
-                    curl -fsS http://127.0.0.1:8000/api/v1/health/ready
+                    curl -fsS http://127.0.0.1:28000/api/v1/health/ready
                 '''
             }
         }
