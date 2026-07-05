@@ -1,0 +1,61 @@
+pipeline {
+    agent any
+    options { timestamps(); disableConcurrentBuilds() }
+    triggers { pollSCM('H/3 * * * *') }
+    environment {
+        APP_NAME = 'PublicFiguresTrackingSystem'
+        DEPLOY_DIR = '/opt/PublicFiguresTrackingSystem'
+    }
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+        stage('Backend test') {
+            steps {
+                dir('src') {
+                    sh '''
+                        python3 -m venv .ci-venv
+                        .ci-venv/bin/python -m pip install -r requirements.txt
+                        PYTHONPATH=. .ci-venv/bin/python -m pytest -q
+                    '''
+                }
+            }
+        }
+        stage('Frontend test and build') {
+            steps {
+                dir('src/app/frontend') {
+                    sh 'npm ci && npm test && npm run build'
+                }
+            }
+        }
+        stage('Stop current service') {
+            steps {
+                sh 'if [ -x "$DEPLOY_DIR/stop.sh" ]; then "$DEPLOY_DIR/stop.sh"; fi'
+            }
+        }
+        stage('Update deployment') {
+            steps {
+                sh '''
+                    mkdir -p "$DEPLOY_DIR"
+                    rsync -a --delete --exclude data --exclude logs --exclude .venv src/ "$DEPLOY_DIR/"
+                    mkdir -p "$DEPLOY_DIR/data" "$DEPLOY_DIR/logs"
+                    if [ ! -f "$DEPLOY_DIR/data/password.txt" ]; then cp src/data/password.txt "$DEPLOY_DIR/data/password.txt"; fi
+                    chmod +x "$DEPLOY_DIR"/*.sh
+                '''
+            }
+        }
+        stage('Start and smoke test') {
+            steps {
+                sh '''
+                    "$DEPLOY_DIR/start.sh"
+                    sleep 3
+                    "$DEPLOY_DIR/status.sh"
+                    curl -fsS http://127.0.0.1:8000/api/v1/health/ready
+                '''
+            }
+        }
+    }
+    post {
+        failure { sh 'if [ -f "$DEPLOY_DIR/logs/server.stderr.log" ]; then tail -n 100 "$DEPLOY_DIR/logs/server.stderr.log"; fi' }
+    }
+}

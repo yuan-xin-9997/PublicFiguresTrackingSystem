@@ -11,7 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-downloads/
+/downloads/
 eggs/
 .eggs/
 lib/
@@ -156,6 +156,17 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Project runtime and frontend dependencies
+src/logs/
+src/app/frontend/node_modules/
+src/data/*.sqlite3
+src/data/*.sqlite3-*
+src/data/*.bak
+src/data/runtime.env
+AGENTS.md
+生成Jenkinsfile的提示词.md
+项目提示词.md
 
 # Spyder project settings
 .spyderproject
