@@ -61,13 +61,31 @@ def _iso_date(text: str, fallback: Optional[str]) -> Optional[str]:
     return None
 
 
+def _content_segments(text: str) -> List[str]:
+    """Split flattened news pages without merging unrelated people and headlines."""
+    segments: List[str] = []
+    for paragraph in re.split(r"[\r\n]+", text):
+        paragraph = " ".join(paragraph.split()).strip()
+        if not paragraph:
+            continue
+        # HTML-to-text output commonly has no whitespace after Chinese punctuation.
+        sentences = re.findall(r".*?(?:[。！？!?][”\"]?|$)", paragraph)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            navigation_parts = re.split(r"(?:国内|国际)?活动更多>>\s*", sentence)
+            # List/index pages often flatten many dated headlines into one punctuation-free
+            # line. A new ISO-style date is a reliable boundary between those entries.
+            for navigation_part in navigation_parts:
+                dated_parts = re.split(r"\s+(?=20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", navigation_part)
+                segments.extend(part.strip() for part in dated_parts if len(part.strip()) >= 6)
+    return segments
+
+
 def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], review_threshold: float) -> List[Dict[str, Any]]:
     text = document["content_text"]
-    # Paragraph splitting preserves paired Chinese quotation marks. Splitting directly on
-    # punctuation would cut before the closing quote and lose direct-quote attribution.
-    segments = [part.strip() for part in re.split(r"[\r\n]+", text) if len(part.strip()) >= 6]
-    if len(segments) <= 1:
-        segments = [part.strip() for part in re.split(r"(?<=[。！？!?])\s+", text) if len(part.strip()) >= 6]
+    segments = _content_segments(text)
     events: List[Dict[str, Any]] = []
     for person in persons:
         names = [person["name"]] + [a for a in person.get("aliases", []) if a]

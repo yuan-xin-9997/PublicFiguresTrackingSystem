@@ -37,3 +37,28 @@ def test_local_extractor_keeps_evidence_and_unknowns():
     assert all(event["evidence_text"] in document["content_text"] for event in events)
     statement = next(event for event in events if event["event_type"] == "statement")
     assert statement["quote_text"] == "人工智能将改变每一个行业。"
+
+
+def test_flattened_profile_index_does_not_become_another_persons_itinerary():
+    document = {
+        "title": "王沪宁-人物资料",
+        "published_at": "2026-07-04T00:00:00+00:00",
+        "language": "zh-CN",
+        "content_text": (
+            "王沪宁 汉族，1955年10月生，山东莱州人 现任中共中央政治局常委，"
+            "十四届全国政协主席 国内活动更多>> 学习贯彻习近平总书记在庆祝中国共产党"
+            "成立105周年大会上的重要讲话精神 2026-07-04 庆祝中国共产党成立105周年大会"
+            "在京隆重举行 2026-07-02 王沪宁出席建设强大国内市场调研协商座谈会。"
+        ),
+    }
+    persons = [
+        {"id": 1, "name": "习近平", "aliases": []},
+        {"id": 2, "name": "王沪宁", "aliases": []},
+    ]
+
+    events = local_extract(document, persons, 0.7)
+
+    xi_events = [event for event in events if event["person_id"] == 1]
+    assert all(event["event_type"] != "itinerary" for event in xi_events)
+    assert not any(event["title"].startswith("王沪宁 汉族") for event in xi_events)
+    assert any(event["person_id"] == 2 and event["event_type"] == "itinerary" for event in events)
