@@ -3,7 +3,7 @@ import urllib.error
 
 import pytest
 
-from app.backend.collectors import _same_site_link, canonicalize_url, clean_article_content, collect_source, ensure_safe_url, infer_published_at, parse_feed, strip_html
+from app.backend.collectors import _article_rejection_reason, _same_site_link, canonicalize_url, clean_article_content, collect_source, ensure_safe_url, infer_published_at, parse_feed, strip_html
 
 
 def test_canonicalize_url_removes_tracking_parameters():
@@ -200,3 +200,55 @@ def test_website_discovery_filters_same_site_links_by_person(monkeypatch):
     assert "https://gov.example/news/he-lifeng.html" in fetched_urls
     assert "https://gov.example/news/other.html" not in fetched_urls
     assert all("other.example" not in url for url in fetched_urls)
+
+
+def test_discovery_does_not_fetch_navigation_link_that_mentions_person(monkeypatch):
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data)
+        calls.append((request.full_url, payload))
+        if request.full_url.endswith("/v1/fetch"):
+            return FakeResponse({
+                "request_id": "req_root", "success": True, "final_url": payload["url"],
+                "status_code": 200, "strategy": "http", "content_type": "text/html",
+                "body": "<html></html>", "artifact_id": "art_root",
+                "fetched_at": "2026-07-08T00:00:00Z", "attempts": [],
+            })
+        if payload.get("adapter") == "generic.links":
+            return FakeResponse({"data": {"links": [
+                {"text": "习近平党建思想专题首页", "href": "/politics/xxjxs/"},
+            ]}})
+        raise AssertionError("导航页不应进入文章正文提取")
+
+    monkeypatch.setenv("TEST_WEBFETCH_KEY", "secret-value")
+    monkeypatch.setattr("app.backend.collectors.urllib.request.urlopen", fake_urlopen)
+    source = {
+        "type": "web_page", "entry_url": "https://gov.example/", "name": "政府网站",
+        "parser_config": json.dumps({"discovery_enabled": True, "discovery_max_pages": 1, "discovery_max_depth": 0}),
+        "discovery_terms": ["习近平"],
+    }
+    documents = collect_source(
+        source,
+        {"provider": "webfetch", "webfetch_base_url": "http://service", "webfetch_api_key_env": "TEST_WEBFETCH_KEY"},
+        10,
+    )
+
+    assert documents == []
+    fetched_urls = [payload["url"] for path, payload in calls if path.endswith("/v1/fetch")]
+    assert fetched_urls == ["https://gov.example/"]
+
+
+def test_rejects_flattened_portal_page_returned_as_article():
+    title = (
+        "新华网首页 专题首页 最新播报 评论解读 智库报告 "
+        "习近平党建思想的时代特质与世界意义 智库报告发布"
+    )
+    document = {
+        "canonical_url": "https://www.news.cn/politics/xxjxs/",
+        "title": title,
+        "published_at": None,
+        "content_text": (title + " 学习进行时 权威速览 要点海报 学习快评 ") * 5,
+    }
+
+    assert _article_rejection_reason(document)

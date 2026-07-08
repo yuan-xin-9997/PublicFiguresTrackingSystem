@@ -27,6 +27,10 @@ NAVIGATION_MARKERS = (
     "news", "politics", "government", "gov", "leadership", "current", "list", "index",
     "新闻", "时政", "政务", "领导", "活动", "要闻", "资讯",
 )
+NAVIGATION_TITLE_MARKERS = (
+    "首页", "专题首页", "最新播报", "评论解读", "智库报告", "权威速览",
+    "要点海报", "学习快评", "更多>>", "更多 >",
+)
 SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf", ".zip", ".rar",
     ".mp3", ".mp4", ".avi", ".css", ".js", ".xml",
@@ -317,11 +321,35 @@ def _same_site_link(href: str, base_url: str, allowed_hosts: Set[str]) -> str:
 
 def _looks_like_navigation(url: str, text: str) -> bool:
     path = urllib.parse.urlsplit(url).path.lower()
+    leaf = path.rstrip("/").rsplit("/", 1)[-1]
+    if leaf in {"", "index", "index.html", "index.htm", "index.shtml", "default.html", "home.html"}:
+        return True
     if path.endswith("/"):
         return any(marker in (text + " " + path).lower() for marker in NAVIGATION_MARKERS)
     if path.endswith((".html", ".htm", ".shtml")):
         return False
     return any(marker in path for marker in ("list", "index", "channel", "search", "news", "politics", "gov"))
+
+
+def _article_rejection_reason(document: Dict[str, Any]) -> str:
+    url = str(document.get("canonical_url") or "")
+    title = " ".join(str(document.get("title") or "").split())
+    content = " ".join(str(document.get("content_text") or "").split())
+    if _looks_like_navigation(url, title):
+        return "URL 或标题指向栏目/首页"
+    if not title or len(title) > 180:
+        return "标题缺失或异常过长"
+    marker_count = sum(1 for marker in NAVIGATION_TITLE_MARKERS if marker in title)
+    if marker_count >= 3:
+        return "标题包含多个导航栏目"
+    if len(content) < 12:
+        return "正文过短"
+    # A flattened portal page often repeats many navigation labels in both its
+    # extracted title and body, even when the generic article adapter returns data.
+    content_marker_count = sum(1 for marker in NAVIGATION_TITLE_MARKERS if marker in content[:1200])
+    if marker_count >= 1 and content_marker_count >= 4 and not document.get("published_at"):
+        return "页面缺少发布时间且正文呈导航聚合结构"
+    return ""
 
 
 def _article_document(url: str, source: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
@@ -402,6 +430,8 @@ def discover_website(source: Dict[str, Any], config: Dict[str, Any], max_items: 
             stats["same_site_links"] += 1
             haystack = (link["text"] + " " + url).lower()
             if any(term in haystack for term in terms):
+                if _looks_like_navigation(url, link["text"]):
+                    continue
                 if url not in candidate_set:
                     candidate_set.add(url)
                     candidates.append(url)
@@ -447,6 +477,10 @@ def discover_website(source: Dict[str, Any], config: Dict[str, Any], max_items: 
             continue
         document["fetch_metadata"]["discovered_from"] = root_url
         document["fetch_metadata"]["discovery_terms"] = terms
+        rejection_reason = _article_rejection_reason(document)
+        if rejection_reason:
+            stats["errors"].append("拒绝非文章页 {}：{}".format(candidate, rejection_reason))
+            continue
         if any(term in (document["title"] + " " + document["content_text"][:4000]).lower() for term in terms):
             documents.append(document)
     stats["accepted"] = len(documents)

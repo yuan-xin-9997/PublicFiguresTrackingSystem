@@ -159,8 +159,10 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
         evidence = str(item.get("evidence_text", ""))
         if not evidence or evidence not in document["content_text"]:
             continue
+        if item.get("event_type") == "other" and not item.get("start_at"):
+            item["start_at"] = _iso_date("", document.get("published_at"))
         item["review_status"] = "approved" if float(item.get("confidence", 0)) >= float(config.get("review_threshold", 0.7)) else "needs_review"
-        item.setdefault("time_precision", "exact" if item.get("start_at") else "unknown")
+        item.setdefault("time_precision", "day" if item.get("start_at") else "unknown")
         item.setdefault("location_precision", "city" if item.get("location_name") else "unknown")
         item.setdefault("end_at", None)
         item.setdefault("original_timezone", "")

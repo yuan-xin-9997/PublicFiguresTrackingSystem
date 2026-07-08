@@ -1,4 +1,6 @@
-from app.backend.extractor import event_dedup_key, local_extract, normalize_location
+import json
+
+from app.backend.extractor import event_dedup_key, external_extract, local_extract, normalize_location
 from app.backend.services import _event_similarity
 
 
@@ -62,3 +64,35 @@ def test_flattened_profile_index_does_not_become_another_persons_itinerary():
     assert all(event["event_type"] != "itinerary" for event in xi_events)
     assert not any(event["title"].startswith("王沪宁 汉族") for event in xi_events)
     assert any(event["person_id"] == 2 and event["event_type"] == "itinerary" for event in events)
+
+
+def test_external_other_event_uses_document_publication_time(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            payload = {"events": [{
+                "person_id": 1, "event_type": "other", "title": "获颁奖项",
+                "summary": "张三获颁年度奖项。", "start_at": None, "location_name": "",
+                "confirmation_status": "completed", "confidence": 0.8,
+                "quote_text": "", "evidence_text": "张三获颁年度奖项。",
+            }]}
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}).encode()
+
+    monkeypatch.setenv("TEST_AI_KEY", "secret")
+    monkeypatch.setattr("app.backend.extractor.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    events = external_extract(
+        {
+            "title": "年度奖项", "content_text": "张三获颁年度奖项。",
+            "published_at": "2026-07-08T09:30:00+08:00", "language": "zh-CN",
+        },
+        [{"id": 1, "name": "张三", "aliases": []}],
+        {"base_url": "https://ai.example", "api_key_env": "TEST_AI_KEY", "model": "test", "review_threshold": 0.7},
+    )
+
+    assert events[0]["start_at"] == "2026-07-08T01:30:00+00:00"
+    assert events[0]["time_precision"] == "day"

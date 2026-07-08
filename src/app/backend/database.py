@@ -285,6 +285,31 @@ class Database:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(1, datetime('now'))"
             )
+            migration_2 = connection.execute("SELECT 1 FROM schema_version WHERE version=2").fetchone()
+            if not migration_2:
+                # Existing un-timed "other" events should use their evidence article's
+                # publication time, matching the extraction behavior for new events.
+                connection.execute("""
+                    UPDATE timeline_events
+                    SET start_at=(
+                        SELECT COALESCE(d.published_at, d.collected_at)
+                        FROM event_evidence ev
+                        JOIN raw_documents d ON d.id=ev.document_id
+                        WHERE ev.event_id=timeline_events.id
+                        ORDER BY COALESCE(d.published_at, d.collected_at), d.id
+                        LIMIT 1
+                    ), time_precision='day'
+                    WHERE event_type='other' AND start_at IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM event_evidence ev
+                        JOIN raw_documents d ON d.id=ev.document_id
+                        WHERE ev.event_id=timeline_events.id
+                          AND COALESCE(d.published_at, d.collected_at) IS NOT NULL
+                      )
+                """)
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(2, datetime('now'))"
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
