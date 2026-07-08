@@ -23,7 +23,8 @@ export function percent(value) {
 export function queryString(values) {
   const params = new URLSearchParams()
   Object.entries(values).forEach(([key, value]) => {
-    if (value !== '' && value !== null && value !== undefined) params.set(key, value)
+    if (Array.isArray(value)) value.filter(Boolean).forEach(item => params.append(key, item))
+    else if (value !== '' && value !== null && value !== undefined) params.set(key, value)
   })
   return params.toString()
 }

@@ -39,6 +39,7 @@ def test_complete_manual_document_to_review_flow(admin_client):
     events = admin_client.get("/api/v1/events", params={"person_id": person_id, "page_size": 20})
     assert events.status_code == 200
     assert events.json()["total"] == 2
+    assert {item["title"] for item in events.json()["items"]} == {"黄仁勋上海公开行程"}
     first = events.json()["items"][0]
     detail = admin_client.get("/api/v1/events/{}".format(first["id"]))
     assert detail.status_code == 200
@@ -69,6 +70,32 @@ def test_complete_manual_document_to_review_flow(admin_client):
     run = admin_client.post("/api/v1/tasks/{}/run".format(task["id"]))
     assert run.status_code == 200
     assert run.json()["status"] == "success"
+
+
+def test_timeline_filters_by_date_location_and_sort_order(admin_client, configured_app):
+    db = configured_app.state.db
+    person_id = db.execute(
+        "INSERT INTO public_figures(name,created_at,updated_at) VALUES(?,?,?)", ("测试人物", "2026-07-01", "2026-07-01")
+    )
+    rows = [
+        (person_id, "itinerary", "北京事件", "摘要", "2026-07-01T00:00:00+00:00", "北京", "filter-1", "2026-07-01", "2026-07-01"),
+        (person_id, "itinerary", "上海事件", "摘要", "2026-07-05T00:00:00+00:00", "上海", "filter-2", "2026-07-05", "2026-07-05"),
+        (person_id, "itinerary", "深圳事件", "摘要", "2026-07-09T00:00:00+00:00", "深圳", "filter-3", "2026-07-09", "2026-07-09"),
+    ]
+    db.execute_many(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,location_name,dedup_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)", rows,
+    )
+
+    filtered = admin_client.get("/api/v1/events", params=[
+        ("start_date", "2026-07-01"), ("end_date", "2026-07-05"),
+        ("location", "北京"), ("location", "上海"), ("sort_order", "asc"),
+    ])
+    assert filtered.status_code == 200
+    assert [item["title"] for item in filtered.json()["items"]] == ["北京事件", "上海事件"]
+    assert admin_client.get("/api/v1/events", params={"sort_order": "invalid"}).status_code == 422
+    assert admin_client.get("/api/v1/events", params={"start_date": "2026-07-10", "end_date": "2026-07-01"}).status_code == 422
+    assert admin_client.get("/api/v1/events/locations").json()["items"] == ["上海", "北京", "深圳"]
 
 
 def test_config_masking_and_user_permissions(admin_client):

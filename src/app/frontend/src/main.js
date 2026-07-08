@@ -32,9 +32,12 @@ const App = {
     const notice = ref('')
     const data = reactive({
       dashboard: null, persons: [], sources: [], tasks: [], runs: [], events: [], eventTotal: 0,
-      selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: []
+      selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: []
     })
-    const filters = reactive({ q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '' })
+    const filters = reactive({
+      q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '',
+      start_date: '', end_date: '', sort_order: 'desc', location: []
+    })
     const loginForm = reactive({ username: 'admin', password: '' })
     const personForm = reactive({ name: '', aliases: '', organization: '', title: '', country_region: '', language: 'zh-CN' })
     const editingPersonId = ref(null)
@@ -103,6 +106,7 @@ const App = {
         if (active.value === 'dashboard') data.dashboard = await api('/dashboard/summary')
         else if (['timeline', 'review', 'map'].includes(active.value)) {
           if (!data.persons.length && user.value.pages.includes('persons')) data.persons = (await api('/persons')).items
+          if (active.value === 'timeline' && !data.locations.length) data.locations = (await api('/events/locations')).items
           const params = active.value === 'map' ? { page_size: 100, event_type: 'itinerary', person_id: mapPersonId.value } : { page_size: 100, ...filters }
           if (active.value === 'review') params.review_status = 'needs_review'
           const result = await api(`/events?${queryString(params)}`)
@@ -260,7 +264,7 @@ const App = {
 
     async function searchNow() { active.value = 'search'; await loadPage() }
 
-    watch(() => [filters.person_id, filters.event_type, filters.confirmation_status, filters.review_status], () => {
+    watch(() => [filters.person_id, filters.event_type, filters.confirmation_status, filters.review_status, filters.start_date, filters.end_date, filters.sort_order, filters.location.join('|')], () => {
       if (['timeline', 'map'].includes(active.value)) loadPage()
     })
     onMounted(checkSession)
@@ -317,6 +321,10 @@ const App = {
             <select v-model="filters.event_type"><option value="">全部类型</option><option value="itinerary">行程</option><option value="statement">言论</option><option value="other">其他</option></select>
             <select v-if="active==='timeline'" v-model="filters.confirmation_status"><option value="">全部发生状态</option><option v-for="s in ['rumored','expected','confirmed','ongoing','completed','cancelled','disputed']" :value="s">{{ statusLabels[s] }}</option></select>
             <select v-if="active==='timeline'" v-model="filters.review_status"><option value="">全部审核状态</option><option v-for="s in ['pending','needs_review','approved','rejected']" :value="s">{{ statusLabels[s] }}</option></select>
+            <input v-if="active==='timeline'" v-model="filters.start_date" type="date" title="开始日期" />
+            <input v-if="active==='timeline'" v-model="filters.end_date" type="date" title="结束日期" />
+            <select v-if="active==='timeline'" v-model="filters.sort_order"><option value="desc">时间降序（新到旧）</option><option value="asc">时间升序（旧到新）</option></select>
+            <select v-if="active==='timeline'" v-model="filters.location" multiple title="地点（可单选或多选）"><option v-for="place in data.locations" :value="place">{{ place }}</option></select>
             <button @click="loadPage">筛选</button>
           </div>
           <p class="result-count">共 {{ data.eventTotal }} 条事件</p>

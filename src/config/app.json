@@ -20,9 +20,9 @@
     "login_window_seconds": 300
   },
   "tasks": {
-    "scheduler_enabled": false,
+    "scheduler_enabled": true,
     "poll_seconds": 30,
-    "max_items_per_run": 50
+    "max_items_per_run": 100
   },
   "collector": {
     "provider": "webfetch",

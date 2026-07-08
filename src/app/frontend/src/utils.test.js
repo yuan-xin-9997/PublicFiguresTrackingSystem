@@ -12,5 +12,7 @@ describe('frontend utilities', () => {
   it('omits empty query values', () => {
     expect(queryString({ q: '', page: 2, status: 'approved' })).toBe('page=2&status=approved')
   })
+  it('repeats array values for multi-select filters', () => {
+    expect(queryString({ location: ['北京', '上海'] })).toBe('location=%E5%8C%97%E4%BA%AC&location=%E4%B8%8A%E6%B5%B7')
+  })
 })
-

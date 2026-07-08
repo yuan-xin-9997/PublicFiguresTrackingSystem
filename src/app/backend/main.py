@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -509,8 +510,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     def list_events(
         page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=200), person_id: Optional[int] = None,
         event_type: str = "", confirmation_status: str = "", review_status: str = "", q: str = "",
+        start_date: str = "", end_date: str = "", sort_order: str = "desc",
+        location: List[str] = Query(default=[]),
         user: Dict[str, Any] = Depends(require_page("timeline")),
     ):
+        if sort_order not in {"asc", "desc"}:
+            raise HTTPException(422, "排序方向必须是 asc 或 desc")
+        date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        if start_date and not date_pattern.match(start_date):
+            raise HTTPException(422, "开始日期格式必须是 YYYY-MM-DD")
+        if end_date and not date_pattern.match(end_date):
+            raise HTTPException(422, "结束日期格式必须是 YYYY-MM-DD")
+        if start_date and end_date and start_date > end_date:
+            raise HTTPException(422, "开始日期不能晚于结束日期")
         clauses: List[str] = []
         params: List[Any] = []
         if not review_status:
@@ -522,15 +534,32 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if q:
             clauses.append("(e.title LIKE ? OR e.summary LIKE ? OR e.location_name LIKE ? OR e.quote_text LIKE ? OR p.name LIKE ?)")
             params.extend(["%" + q + "%"] * 5)
+        if start_date:
+            clauses.append("substr(e.start_at,1,10)>=?")
+            params.append(start_date)
+        if end_date:
+            clauses.append("substr(e.start_at,1,10)<=?")
+            params.append(end_date)
+        locations = list(dict.fromkeys(item.strip() for item in location if item.strip()))
+        if locations:
+            clauses.append("e.location_name IN ({})".format(",".join("?" for _ in locations)))
+            params.extend(locations)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         base = " FROM timeline_events e JOIN public_figures p ON p.id=e.person_id "
         total = int(db.fetch_one("SELECT COUNT(*) n" + base + where, params)["n"])
         query_params = list(params) + [page_size, (page - 1) * page_size]
         items = db.fetch_all(
             "SELECT e.*,p.name AS person_name,(SELECT COUNT(*) FROM event_evidence ev WHERE ev.event_id=e.id) evidence_count" + base + where +
-            " ORDER BY COALESCE(e.start_at,e.created_at) DESC,e.id DESC LIMIT ? OFFSET ?", query_params,
+            " ORDER BY COALESCE(e.start_at,e.created_at) " + sort_order.upper() + ",e.id " + sort_order.upper() + " LIMIT ? OFFSET ?", query_params,
         )
         return _list_response(items, total, page, page_size)
+
+    @application.get("/api/v1/events/locations")
+    def event_locations(user: Dict[str, Any] = Depends(require_page("timeline"))):
+        return {"items": [row["location_name"] for row in db.fetch_all(
+            "SELECT DISTINCT location_name FROM timeline_events "
+            "WHERE location_name!='' AND review_status!='rejected' ORDER BY location_name"
+        )]}
 
     @application.get("/api/v1/events/{event_id}")
     def get_event(event_id: int, user: Dict[str, Any] = Depends(require_page("timeline"))):

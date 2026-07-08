@@ -109,10 +109,8 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
             if any(word in segment for word in ("据称", "可能", "预计", "传闻", "或将")):
                 confirmation = "rumored" if "传闻" in segment or "据称" in segment else "expected"
                 confidence -= 0.1
-            core_text = event_core_text(segment)
-            title = core_text[:80].rstrip("，。,. ")
             events.append({
-                "person_id": person["id"], "event_type": event_type, "title": title,
+                "person_id": person["id"], "event_type": event_type, "title": str(document.get("title") or "未命名材料")[:500],
                 "summary": segment[:500], "start_at": start_at, "end_at": None,
                 "original_timezone": "", "time_precision": "day" if start_at else "unknown",
                 "location_name": location, "location_precision": "city" if location else "unknown",
@@ -159,6 +157,8 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
         evidence = str(item.get("evidence_text", ""))
         if not evidence or evidence not in document["content_text"]:
             continue
+        extracted_title = str(item.get("title") or evidence)
+        item["title"] = str(document.get("title") or "未命名材料")[:500]
         if item.get("event_type") == "other" and not item.get("start_at"):
             item["start_at"] = _iso_date("", document.get("published_at"))
         item["review_status"] = "approved" if float(item.get("confidence", 0)) >= float(config.get("review_threshold", 0.7)) else "needs_review"
@@ -169,7 +169,7 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
         item.setdefault("translated_text", "")
         item.setdefault("original_language", document.get("language", ""))
         item.setdefault("speech_context", "")
-        item["dedup_key"] = event_dedup_key(item["person_id"], item["event_type"], item.get("start_at"), item.get("title", ""))
+        item["dedup_key"] = event_dedup_key(item["person_id"], item["event_type"], item.get("start_at"), extracted_title)
         events.append(item)
     return events
 
