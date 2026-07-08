@@ -88,6 +88,48 @@ def test_config_masking_and_user_permissions(admin_client):
     assert any(item["action"] == "permissions" for item in audit["items"])
 
 
+def test_admin_can_preview_and_cleanup_navigation_documents(admin_client, configured_app):
+    person = admin_client.post("/api/v1/persons", json={
+        "name": "习近平", "native_name": "", "bio": "", "organization": "", "title": "",
+        "country_region": "中国", "language": "zh-CN", "avatar_path": "", "enabled": True, "aliases": [],
+    }).json()
+    source = admin_client.post("/api/v1/sources", json={
+        "name": "新华网", "type": "website", "entry_url": "https://www.news.cn/", "organization": "",
+        "language": "zh-CN", "trust_level": 5, "schedule_seconds": 3600, "enabled": True,
+        "person_ids": [person["id"]], "discovery_enabled": True, "discovery_max_pages": 10,
+        "discovery_max_depth": 1,
+    }).json()
+    db = configured_app.state.db
+    document_id = db.execute(
+        "INSERT INTO raw_documents(source_id,canonical_url,title,collected_at,content_text,content_hash,status) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (source["id"], "https://www.news.cn/politics/xxjxs/", "新华网首页 专题首页 最新播报 评论解读 智库报告",
+         "2026-07-08T00:00:00+00:00", "习近平专题首页 最新播报 评论解读 智库报告 权威速览" * 5, "nav-hash", "analyzed"),
+    )
+    event_id = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (person["id"], "other", "错误聚合事件", "摘要", "nav-event", "2026-07-08", "2026-07-08"),
+    )
+    db.execute(
+        "INSERT INTO event_evidence(event_id,document_id,evidence_text) VALUES(?,?,?)",
+        (event_id, document_id, "习近平专题首页"),
+    )
+
+    preview = admin_client.post("/api/v1/maintenance/cleanup-navigation-pages", json={"dry_run": True})
+    assert preview.status_code == 200
+    assert preview.json()["documents"] == 1
+    assert preview.json()["events"] == 1
+    assert db.fetch_one("SELECT id FROM raw_documents WHERE id=?", (document_id,))
+
+    cleaned = admin_client.post("/api/v1/maintenance/cleanup-navigation-pages", json={"dry_run": False})
+    assert cleaned.status_code == 200
+    assert cleaned.json()["deleted"] is True
+    assert db.fetch_one("SELECT id FROM raw_documents WHERE id=?", (document_id,)) is None
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (event_id,)) is None
+    assert any(item["action"] == "cleanup_navigation_pages" for item in admin_client.get("/api/v1/audit-logs").json()["items"])
+
+
 def test_person_can_be_edited_and_soft_deleted(admin_client):
     created = admin_client.post("/api/v1/persons", json={
         "name": "测试人物", "native_name": "", "bio": "初始简介", "organization": "甲组织",

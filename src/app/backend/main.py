@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .collectors import collect_source
+from .collectors import _article_rejection_reason, collect_source
 from .config import Settings, load_config
 from .database import Database, json_text
 from .scheduler import Scheduler
@@ -93,6 +93,10 @@ class ReviewBody(BaseModel):
 
 class PermissionBody(BaseModel):
     pages: List[str]
+
+
+class CleanupNavigationBody(BaseModel):
+    dry_run: bool = True
 
 
 def configure_logging(settings: Settings) -> None:
@@ -631,6 +635,60 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             (page_size, (page - 1) * page_size),
         )
         return _list_response(items, total, page, page_size)
+
+    @application.post("/api/v1/maintenance/cleanup-navigation-pages")
+    def cleanup_navigation_pages(
+        body: CleanupNavigationBody, request: Request, user: Dict[str, Any] = Depends(require_admin),
+    ):
+        documents = db.fetch_all(
+            "SELECT d.id,d.canonical_url,d.title,d.published_at,d.content_text,s.name AS source_name "
+            "FROM raw_documents d JOIN information_sources s ON s.id=d.source_id "
+            "WHERE d.canonical_url LIKE 'http%' AND s.parser_config LIKE '%\"discovery_enabled\":true%'"
+        )
+        rejected = []
+        for document in documents:
+            reason = _article_rejection_reason(document)
+            if reason:
+                rejected.append({
+                    "id": document["id"], "title": document["title"],
+                    "canonical_url": document["canonical_url"], "source_name": document["source_name"],
+                    "reason": reason,
+                })
+        document_ids = [item["id"] for item in rejected]
+        evidence_count = 0
+        orphan_event_ids: List[int] = []
+        if document_ids:
+            placeholders = ",".join("?" for _ in document_ids)
+            evidence_count = int(db.fetch_one(
+                "SELECT COUNT(*) n FROM event_evidence WHERE document_id IN ({})".format(placeholders), document_ids
+            )["n"])
+            orphan_event_ids = [row["event_id"] for row in db.fetch_all(
+                "SELECT DISTINCT ev.event_id FROM event_evidence ev WHERE ev.document_id IN ({0}) "
+                "AND NOT EXISTS (SELECT 1 FROM event_evidence keep WHERE keep.event_id=ev.event_id "
+                "AND keep.document_id NOT IN ({0}))".format(placeholders), document_ids + document_ids,
+            )]
+        result = {
+            "dry_run": body.dry_run, "documents": len(document_ids), "evidence": evidence_count,
+            "events": len(orphan_event_ids), "sample": rejected[:20],
+        }
+        if body.dry_run or not document_ids:
+            return result
+        placeholders = ",".join("?" for _ in document_ids)
+        with db.transaction() as connection:
+            connection.execute("DELETE FROM model_runs WHERE document_id IN ({})".format(placeholders), document_ids)
+            connection.execute("DELETE FROM attachments WHERE document_id IN ({})".format(placeholders), document_ids)
+            connection.execute("DELETE FROM event_evidence WHERE document_id IN ({})".format(placeholders), document_ids)
+            if orphan_event_ids:
+                event_placeholders = ",".join("?" for _ in orphan_event_ids)
+                connection.execute("DELETE FROM event_history WHERE event_id IN ({})".format(event_placeholders), orphan_event_ids)
+                connection.execute("DELETE FROM timeline_events WHERE id IN ({})".format(event_placeholders), orphan_event_ids)
+            connection.execute("DELETE FROM raw_documents WHERE id IN ({})".format(placeholders), document_ids)
+        audit(
+            db, "cleanup_navigation_pages", "maintenance", "", user["id"], ip_address=_client_ip(request),
+            summary="删除聚合页材料 {}、证据 {}、孤立事件 {}".format(len(document_ids), evidence_count, len(orphan_event_ids)),
+        )
+        result["deleted"] = True
+        return result
 
     frontend_dist = settings.src_root / "app" / "frontend" / "dist"
     if frontend_dist.exists():
