@@ -4,7 +4,7 @@ import os
 import re
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 
@@ -14,6 +14,7 @@ DATE_PATTERNS = [
     re.compile(r"(?P<y>20\d{2})[-/.年](?P<m>\d{1,2})[-/.月](?P<d>\d{1,2})日?"),
     re.compile(r"(?P<m>\d{1,2})月(?P<d>\d{1,2})日"),
 ]
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 QUOTE_PATTERN = re.compile(r"[“\"]([^”\"]{4,400})[”\"]")
 LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·\s]{2,24}?)(?:举行|出席|访问|会见|表示|，|。|,|$)")
 LOCATION_ALIASES = {"首尔总统府": "韩国总统府"}
@@ -43,19 +44,29 @@ def event_dedup_key(person_id: int, event_type: str, start_at: Optional[str], te
 
 
 def _iso_date(text: str, fallback: Optional[str]) -> Optional[str]:
-    for pattern in DATE_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            now = datetime.now(timezone.utc)
-            year = int(match.groupdict().get("y") or now.year)
-            try:
-                return datetime(year, int(match.group("m")), int(match.group("d")), tzinfo=timezone.utc).isoformat()
-            except ValueError:
-                return None
+    # A month/day mention is not sufficiently anchored on its own: using the
+    # process year turned old articles into current-year events. Prefer the
+    # article's complete timestamp unless the evidence states the year too.
+    match = DATE_PATTERNS[0].search(text)
+    if match:
+        try:
+            return datetime(
+                int(match.group("y")), int(match.group("m")), int(match.group("d")),
+                tzinfo=BEIJING_TIMEZONE,
+            ).isoformat()
+        except ValueError:
+            return None
     if fallback:
         try:
             normalized = fallback.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized).astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        except ValueError:
+            return None
+    match = DATE_PATTERNS[1].search(text)
+    if match:
+        try:
+            now = datetime.now(BEIJING_TIMEZONE)
+            return datetime(now.year, int(match.group("m")), int(match.group("d")), tzinfo=BEIJING_TIMEZONE).isoformat()
         except ValueError:
             return None
     return None
@@ -102,6 +113,7 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
             else:
                 event_type = "other"
             start_at = _iso_date(segment, document.get("published_at"))
+            has_explicit_full_date = bool(DATE_PATTERNS[0].search(segment))
             location_match = LOCATION_PATTERN.search(segment)
             location = normalize_location(location_match.group(1)) if location_match and event_type == "itinerary" else ""
             confidence = 0.55 + (0.12 if start_at else 0) + (0.08 if quote_match else 0) + min(0.1, len(segment) / 1000)
@@ -112,7 +124,8 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
             events.append({
                 "person_id": person["id"], "event_type": event_type, "title": str(document.get("title") or "未命名材料")[:500],
                 "summary": segment[:500], "start_at": start_at, "end_at": None,
-                "original_timezone": "", "time_precision": "day" if start_at else "unknown",
+                "original_timezone": "Asia/Shanghai" if start_at else "",
+                "time_precision": "day" if has_explicit_full_date else ("exact" if start_at else "unknown"),
                 "location_name": location, "location_precision": "city" if location else "unknown",
                 "confirmation_status": confirmation,
                 "review_status": "approved" if confidence >= review_threshold and confirmation not in {"rumored", "disputed"} else "needs_review",

@@ -28,6 +28,34 @@ def test_related_unclassified_fact_becomes_other():
     assert events[0]["event_type"] == "other"
 
 
+def test_month_day_uses_article_timestamp_instead_of_runtime_year():
+    events = local_extract(
+        {
+            "title": "聚焦建设五个中心重要使命",
+            "content_text": "12月3日，张三强调加快推进重点工作。",
+            "published_at": "2023-12-04T08:31:00+08:00",
+            "language": "zh-CN",
+        },
+        [{"id": 1, "name": "张三", "aliases": []}], 0.7,
+    )
+    assert events[0]["start_at"] == "2023-12-04T00:31:00+00:00"
+    assert events[0]["time_precision"] == "exact"
+
+
+def test_full_chinese_date_is_saved_as_beijing_calendar_day():
+    events = local_extract(
+        {
+            "title": "公开行程",
+            "content_text": "2023年12月3日，张三在上海出席会议。",
+            "published_at": "2023-12-04T08:31:00+08:00",
+            "language": "zh-CN",
+        },
+        [{"id": 1, "name": "张三", "aliases": []}], 0.7,
+    )
+    assert events[0]["start_at"] == "2023-12-03T00:00:00+08:00"
+    assert events[0]["time_precision"] == "day"
+
+
 def test_local_extractor_keeps_evidence_and_unknowns():
     document = {
         "title": "黄仁勋公开活动", "published_at": "2026-07-02T00:00:00+00:00", "language": "zh-CN",

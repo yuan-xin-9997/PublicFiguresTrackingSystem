@@ -310,6 +310,32 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(2, datetime('now'))"
                 )
+            # Repair events created by the former month/day parser, which used
+            # the server's current year for historical articles. Human-edited
+            # records are intentionally excluded.
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=3").fetchone():
+                connection.execute("""
+                    UPDATE timeline_events
+                    SET start_at = (
+                            SELECT MIN(d.published_at)
+                            FROM event_evidence ee
+                            JOIN raw_documents d ON d.id=ee.document_id
+                            WHERE ee.event_id=timeline_events.id AND d.published_at IS NOT NULL
+                        ),
+                        time_precision='exact', original_timezone='Asia/Shanghai'
+                    WHERE human_locked=0
+                      AND substr(start_at,1,4)=strftime('%Y','now')
+                      AND EXISTS (
+                          SELECT 1 FROM event_evidence ee
+                          JOIN raw_documents d ON d.id=ee.document_id
+                          WHERE ee.event_id=timeline_events.id
+                            AND d.published_at IS NOT NULL
+                            AND substr(d.published_at,1,4) < substr(timeline_events.start_at,1,4)
+                      )
+                """)
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(3, datetime('now'))"
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
