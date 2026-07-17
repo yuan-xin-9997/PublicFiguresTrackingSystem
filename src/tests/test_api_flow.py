@@ -122,6 +122,25 @@ def test_timeline_hides_legacy_other_when_same_document_has_statement(admin_clie
     assert [(item["event_type"], item["source_names"]) for item in payload["items"]] == [("statement", "新华社")]
 
 
+def test_later_evidence_upgrades_event_to_more_specific_location(admin_client):
+    person_id = admin_client.post("/api/v1/persons", json={
+        "name": "张三", "native_name": "", "bio": "", "organization": "", "title": "",
+        "country_region": "", "language": "zh-CN", "avatar_path": "", "enabled": True, "aliases": [],
+    }).json()["id"]
+    source_id = admin_client.post("/api/v1/sources", json={
+        "name": "测试来源", "type": "manual", "entry_url": "", "organization": "", "language": "zh-CN",
+        "trust_level": 4, "schedule_seconds": 3600, "enabled": True, "person_ids": [person_id],
+    }).json()["id"]
+    for index, location in enumerate(("上海", "上海西郊宾馆")):
+        response = admin_client.post("/api/v1/documents/manual", json={
+            "source_id": source_id, "title": "张三会见来宾", "content_text": "张三在{}会见来宾。".format(location),
+            "canonical_url": "https://example.com/location/{}".format(index), "published_at": "2026-07-17T08:00:00+08:00",
+        })
+        assert response.status_code == 201, response.text
+    itinerary = admin_client.get("/api/v1/events", params={"person_id": person_id, "event_type": "itinerary"}).json()["items"]
+    assert len(itinerary) == 1 and itinerary[0]["location_name"] == "上海西郊宾馆"
+
+
 def test_config_masking_and_user_permissions(admin_client):
     config = admin_client.get("/api/v1/config/effective")
     assert config.status_code == 200

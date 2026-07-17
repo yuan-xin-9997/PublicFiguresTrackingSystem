@@ -150,12 +150,22 @@ def analyze_document(db: Database, document_id: int, ai_config: Dict[str, Any]) 
                 matched_id = _matching_event(connection, event)
                 if matched_id:
                     event_id = matched_id
-                    incoming_start = normalize_datetime(event.get("start_at"))
-                    connection.execute(
-                        "UPDATE timeline_events SET start_at=CASE WHEN start_at>? THEN ? ELSE start_at END,updated_at=? WHERE id=?",
-                        (incoming_start, incoming_start, now, event_id),
-                    )
                     existing = True
+            if existing:
+                incoming_start = normalize_datetime(event.get("start_at"))
+                incoming_location = event.get("location_name", "")[:300]
+                connection.execute(
+                    "UPDATE timeline_events SET "
+                    "start_at=CASE WHEN ? IS NOT NULL AND (start_at IS NULL OR start_at>?) THEN ? ELSE start_at END,"
+                    "location_name=CASE WHEN length(?)>length(location_name) THEN ? ELSE location_name END,"
+                    "location_precision=CASE WHEN length(?)>length(location_name) THEN ? ELSE location_precision END,updated_at=? "
+                    "WHERE id=? AND human_locked=0",
+                    (
+                        incoming_start, incoming_start, incoming_start,
+                        incoming_location, incoming_location, incoming_location,
+                        event.get("location_precision", "unknown"), now, event_id,
+                    ),
+                )
             if not existing:
                 cursor = connection.execute(
                     "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,"

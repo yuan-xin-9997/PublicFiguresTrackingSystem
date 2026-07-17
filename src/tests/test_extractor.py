@@ -116,14 +116,25 @@ def test_quoted_leader_is_not_mistaken_for_actor():
             "title": "李鸿忠在安徽、河南开展执法检查时强调",
             "published_at": "2026-07-16T00:00:00+00:00",
             "language": "zh-CN",
-            "content_text": "李鸿忠在安徽、河南开展执法检查时强调，坚持以习近平总书记关于国家粮食安全重要论述精神为指导。",
+            "content_text": "李鸿忠在安徽、河南开展执法检查。他强调，要坚持以习近平总书记关于国家粮食安全重要论述精神为指导。",
         },
         [{"id": 1, "name": "习近平", "aliases": []}, {"id": 2, "name": "李鸿忠", "aliases": []}],
         0.7,
     )
 
     assert events and {event["person_id"] for event in events} == {2}
-    assert events[0]["location_name"] == "安徽、河南"
+    assert {event["location_name"] for event in events} == {"安徽、河南"}
+
+
+def test_abstract_zai_clause_is_not_a_location():
+    events = local_extract(
+        {
+            "title": "习近平强调党建工作", "published_at": "2026-07-17T00:00:00+00:00",
+            "language": "zh-CN", "content_text": "习近平强调，中国共产党在管党治党、兴党强党的伟大实践中形成新时代党建思想。",
+        },
+        [{"id": 1, "name": "习近平", "aliases": []}], 0.7,
+    )
+    assert events[0]["location_name"] == ""
 
 
 def test_external_other_event_uses_document_publication_time(monkeypatch):

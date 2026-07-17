@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 
-ITINERARY_WORDS = ("访问", "出席", "前往", "抵达", "行程", "会见", "将于", "计划", "visit", "attend", "travel")
+ITINERARY_WORDS = ("访问", "出席", "前往", "抵达", "行程", "会见", "开展", "检查", "调研", "考察", "将于", "计划", "visit", "attend", "travel")
 STATEMENT_WORDS = ("表示", "称", "指出", "强调", "宣布", "说", "statement", "said", "says", "announced")
 DATE_PATTERNS = [
     re.compile(r"(?P<y>20\d{2})[-/.年](?P<m>\d{1,2})[-/.月](?P<d>\d{1,2})日?"),
@@ -16,7 +16,7 @@ DATE_PATTERNS = [
 ]
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 QUOTE_PATTERN = re.compile(r"[“\"]([^”\"]{4,400})[”\"]")
-LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·、\s]{2,30}?)(?=举行|出席|访问|会见|表示|开展|进行|调研|考察|检查|主持|召开|，|。|,|$)")
+LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·、\s]{2,30}?)(?=举行|出席|访问|会见|表示|指出|强调|宣布|开展|进行|调研|考察|检查|主持|召开)")
 LOCATION_ALIASES = {"首尔总统府": "韩国总统府"}
 
 
@@ -37,7 +37,13 @@ def _primary_person_id(text: str, persons: List[Dict[str, Any]]) -> Optional[int
         positions = [position for position in positions if position >= 0]
         if positions:
             mentions.append((min(positions), person["id"]))
-    return min(mentions)[1] if mentions else None
+    if not mentions:
+        return None
+    actions = [lowered.find(word) for word in (*ITINERARY_WORDS, *STATEMENT_WORDS) if lowered.find(word) >= 0]
+    if not actions:
+        return min(mentions)[1]
+    before_action = [mention for mention in mentions if mention[0] < min(actions)]
+    return max(before_action)[1] if before_action else None
 
 
 def _nearby_location(segments: List[str], index: int) -> str:
@@ -123,9 +129,18 @@ def _content_segments(text: str) -> List[str]:
 def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], review_threshold: float) -> List[Dict[str, Any]]:
     text = document["content_text"]
     segments = _content_segments(text)
+    previous_person_id = _primary_person_id(document.get("title") or "", persons)
+    owners = []
+    for segment in segments:
+        person_id = _primary_person_id(segment, persons)
+        if re.match(r"^(?:他|她)(?:指出|表示|强调|宣布|说)", segment) and previous_person_id is not None:
+            person_id = previous_person_id
+        owners.append(person_id)
+        if person_id is not None:
+            previous_person_id = person_id
     events: List[Dict[str, Any]] = []
     for person in persons:
-        relevant = [(index, segment) for index, segment in enumerate(segments) if _primary_person_id(segment, persons) == person["id"]]
+        relevant = [(index, segment) for index, segment in enumerate(segments) if owners[index] == person["id"]]
         if not relevant and _primary_person_id(document.get("title") or "", persons) == person["id"]:
             relevant = list(enumerate(segments[:1] or [document["title"]]))
         for segment_index, segment in relevant[:8]:
