@@ -523,7 +523,13 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(422, "结束日期格式必须是 YYYY-MM-DD")
         if start_date and end_date and start_date > end_date:
             raise HTTPException(422, "开始日期不能晚于结束日期")
-        clauses: List[str] = []
+        clauses: List[str] = [
+            "NOT (e.event_type='other' AND EXISTS ("
+            "SELECT 1 FROM event_evidence oe JOIN event_evidence same_doc ON same_doc.document_id=oe.document_id "
+            "JOIN timeline_events preferred ON preferred.id=same_doc.event_id "
+            "WHERE oe.event_id=e.id AND preferred.person_id=e.person_id AND preferred.event_type='statement' "
+            "AND preferred.review_status!='rejected'))"
+        ]
         params: List[Any] = []
         if not review_status:
             clauses.append("e.review_status!='rejected'")
@@ -549,7 +555,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         total = int(db.fetch_one("SELECT COUNT(*) n" + base + where, params)["n"])
         query_params = list(params) + [page_size, (page - 1) * page_size]
         items = db.fetch_all(
-            "SELECT e.*,p.name AS person_name,(SELECT COUNT(*) FROM event_evidence ev WHERE ev.event_id=e.id) evidence_count" + base + where +
+            "SELECT e.*,p.name AS person_name,(SELECT COUNT(*) FROM event_evidence ev WHERE ev.event_id=e.id) evidence_count,"
+            "COALESCE((SELECT GROUP_CONCAT(DISTINCT s.name) FROM event_evidence ev "
+            "JOIN raw_documents d ON d.id=ev.document_id JOIN information_sources s ON s.id=d.source_id "
+            "WHERE ev.event_id=e.id),'') source_names" + base + where +
             " ORDER BY COALESCE(e.start_at,e.created_at) " + sort_order.upper() + ",e.id " + sort_order.upper() + " LIMIT ? OFFSET ?", query_params,
         )
         return _list_response(items, total, page, page_size)

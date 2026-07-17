@@ -37,8 +37,9 @@ pipeline {
             steps {
                 sh '''
                     mkdir -p "$DEPLOY_DIR"
-                    rsync -a --delete --exclude data --exclude logs --exclude .venv --exclude .ci-venv --exclude .pytest_cache src/ "$DEPLOY_DIR/"
-                    mkdir -p "$DEPLOY_DIR/data" "$DEPLOY_DIR/logs"
+                    rsync -a --delete --exclude data --exclude logs --exclude config/app.json --exclude .venv --exclude .ci-venv --exclude .pytest_cache src/ "$DEPLOY_DIR/"
+                    mkdir -p "$DEPLOY_DIR/config" "$DEPLOY_DIR/data" "$DEPLOY_DIR/logs"
+                    if [ ! -f "$DEPLOY_DIR/config/app.json" ]; then cp src/config/app.json "$DEPLOY_DIR/config/app.json"; fi
                     if [ ! -f "$DEPLOY_DIR/data/password.txt" ]; then cp src/data/password.txt "$DEPLOY_DIR/data/password.txt"; fi
                     chmod +x "$DEPLOY_DIR"/*.sh
                 '''

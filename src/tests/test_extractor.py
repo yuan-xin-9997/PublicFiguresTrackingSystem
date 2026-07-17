@@ -94,6 +94,38 @@ def test_flattened_profile_index_does_not_become_another_persons_itinerary():
     assert any(event["person_id"] == 2 and event["event_type"] == "itinerary" for event in events)
 
 
+def test_actor_location_and_statement_priority():
+    document = {
+        "title": "习近平会见柬埔寨首相洪玛奈",
+        "published_at": "2026-07-16T00:00:00+00:00",
+        "language": "zh-CN",
+        "content_text": (
+            "习近平会见柬埔寨首相洪玛奈。会见在上海西郊宾馆举行。"
+            "习近平表示，中柬友谊历久弥新。习近平获赠纪念品。"
+        ),
+    }
+    events = local_extract(document, [{"id": 1, "name": "习近平", "aliases": []}], 0.7)
+
+    assert {event["event_type"] for event in events} == {"itinerary", "statement"}
+    assert next(event for event in events if event["event_type"] == "itinerary")["location_name"] == "上海西郊宾馆"
+
+
+def test_quoted_leader_is_not_mistaken_for_actor():
+    events = local_extract(
+        {
+            "title": "李鸿忠在安徽、河南开展执法检查时强调",
+            "published_at": "2026-07-16T00:00:00+00:00",
+            "language": "zh-CN",
+            "content_text": "李鸿忠在安徽、河南开展执法检查时强调，坚持以习近平总书记关于国家粮食安全重要论述精神为指导。",
+        },
+        [{"id": 1, "name": "习近平", "aliases": []}, {"id": 2, "name": "李鸿忠", "aliases": []}],
+        0.7,
+    )
+
+    assert events and {event["person_id"] for event in events} == {2}
+    assert events[0]["location_name"] == "安徽、河南"
+
+
 def test_external_other_event_uses_document_publication_time(monkeypatch):
     class Response:
         def __enter__(self):

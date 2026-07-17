@@ -40,6 +40,7 @@ def test_complete_manual_document_to_review_flow(admin_client):
     assert events.status_code == 200
     assert events.json()["total"] == 2
     assert {item["title"] for item in events.json()["items"]} == {"黄仁勋上海公开行程"}
+    assert {item["source_names"] for item in events.json()["items"]} == {"人工公开材料"}
     first = events.json()["items"][0]
     detail = admin_client.get("/api/v1/events/{}".format(first["id"]))
     assert detail.status_code == 200
@@ -96,6 +97,29 @@ def test_timeline_filters_by_date_location_and_sort_order(admin_client, configur
     assert admin_client.get("/api/v1/events", params={"sort_order": "invalid"}).status_code == 422
     assert admin_client.get("/api/v1/events", params={"start_date": "2026-07-10", "end_date": "2026-07-01"}).status_code == 422
     assert admin_client.get("/api/v1/events/locations").json()["items"] == ["上海", "北京", "深圳"]
+
+
+def test_timeline_hides_legacy_other_when_same_document_has_statement(admin_client, configured_app):
+    db = configured_app.state.db
+    person_id = db.execute("INSERT INTO public_figures(name,created_at,updated_at) VALUES('张三','2026-07-01','2026-07-01')")
+    source_id = db.execute("INSERT INTO information_sources(name,type,created_at,updated_at) VALUES('新华社','manual','2026-07-01','2026-07-01')")
+    document_id = db.execute(
+        "INSERT INTO raw_documents(source_id,title,collected_at,content_text,content_hash,status) VALUES(?,?,?,?,?,'analyzed')",
+        (source_id, "张三发表讲话", "2026-07-01", "张三发表讲话。", "statement-doc"),
+    )
+    event_ids = []
+    for event_type in ("statement", "other"):
+        event_ids.append(db.execute(
+            "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (person_id, event_type, "张三发表讲话", "摘要", "legacy-" + event_type, "2026-07-01", "2026-07-01"),
+        ))
+    db.execute_many(
+        "INSERT INTO event_evidence(event_id,document_id,evidence_text) VALUES(?,?,?)",
+        [(event_id, document_id, "张三发表讲话。") for event_id in event_ids],
+    )
+
+    payload = admin_client.get("/api/v1/events", params={"person_id": person_id}).json()
+    assert [(item["event_type"], item["source_names"]) for item in payload["items"]] == [("statement", "新华社")]
 
 
 def test_config_masking_and_user_permissions(admin_client):

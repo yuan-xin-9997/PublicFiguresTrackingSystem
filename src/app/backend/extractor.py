@@ -16,7 +16,7 @@ DATE_PATTERNS = [
 ]
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 QUOTE_PATTERN = re.compile(r"[“\"]([^”\"]{4,400})[”\"]")
-LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·\s]{2,24}?)(?:举行|出席|访问|会见|表示|，|。|,|$)")
+LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·、\s]{2,30}?)(?=举行|出席|访问|会见|表示|开展|进行|调研|考察|检查|主持|召开|，|。|,|$)")
 LOCATION_ALIASES = {"首尔总统府": "韩国总统府"}
 
 
@@ -27,6 +27,32 @@ def normalize_location(value: str) -> str:
     if "在" in clean:
         clean = clean.rsplit("在", 1)[-1].strip()
     return LOCATION_ALIASES.get(clean, clean)
+
+
+def _primary_person_id(text: str, persons: List[Dict[str, Any]]) -> Optional[int]:
+    lowered = text.lower()
+    mentions = []
+    for person in persons:
+        positions = [lowered.find(name.lower()) for name in [person["name"], *person.get("aliases", [])] if name]
+        positions = [position for position in positions if position >= 0]
+        if positions:
+            mentions.append((min(positions), person["id"]))
+    return min(mentions)[1] if mentions else None
+
+
+def _nearby_location(segments: List[str], index: int) -> str:
+    for candidate_index in (index, index + 1, index - 1):
+        if 0 <= candidate_index < len(segments):
+            candidate = segments[candidate_index]
+            match = LOCATION_PATTERN.search(candidate)
+            if match and (candidate_index == index or "举行" in candidate or any(word in candidate.lower() for word in ITINERARY_WORDS)):
+                return normalize_location(match.group(1))
+    return ""
+
+
+def _prefer_statements(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    statement_people = {event["person_id"] for event in events if event["event_type"] == "statement"}
+    return [event for event in events if event["event_type"] != "other" or event["person_id"] not in statement_people]
 
 
 def event_core_text(text: str) -> str:
@@ -99,11 +125,10 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
     segments = _content_segments(text)
     events: List[Dict[str, Any]] = []
     for person in persons:
-        names = [person["name"]] + [a for a in person.get("aliases", []) if a]
-        relevant = [segment for segment in segments if any(name.lower() in segment.lower() for name in names)]
-        if not relevant and any(name.lower() in (document.get("title") or "").lower() for name in names):
-            relevant = segments[:1] or [document["title"]]
-        for segment in relevant[:8]:
+        relevant = [(index, segment) for index, segment in enumerate(segments) if _primary_person_id(segment, persons) == person["id"]]
+        if not relevant and _primary_person_id(document.get("title") or "", persons) == person["id"]:
+            relevant = list(enumerate(segments[:1] or [document["title"]]))
+        for segment_index, segment in relevant[:8]:
             lowered = segment.lower()
             quote_match = QUOTE_PATTERN.search(segment)
             if quote_match or any(word in lowered for word in STATEMENT_WORDS):
@@ -114,8 +139,7 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
                 event_type = "other"
             start_at = _iso_date(segment, document.get("published_at"))
             has_explicit_full_date = bool(DATE_PATTERNS[0].search(segment))
-            location_match = LOCATION_PATTERN.search(segment)
-            location = normalize_location(location_match.group(1)) if location_match and event_type == "itinerary" else ""
+            location = _nearby_location(segments, segment_index)
             confidence = 0.55 + (0.12 if start_at else 0) + (0.08 if quote_match else 0) + min(0.1, len(segment) / 1000)
             confirmation = "completed" if start_at and start_at <= datetime.now(timezone.utc).isoformat() else "expected"
             if any(word in segment for word in ("据称", "可能", "预计", "传闻", "或将")):
@@ -134,7 +158,7 @@ def local_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], revie
                 "translated_text": "", "original_language": document.get("language", ""), "speech_context": "",
                 "evidence_text": segment[:1000], "dedup_key": event_dedup_key(person["id"], event_type, start_at, segment),
             })
-    return events
+    return _prefer_statements(events)
 
 
 def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -143,7 +167,7 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
     if not base_url or not api_key:
         raise ValueError("外部模型未配置")
     prompt = {
-        "task": "只根据正文抽取公开人物相关事实，类型限行程、言论、其他；无法明确归为行程或言论时使用 other，不得遗漏相关事实。未知字段必须为空，证据必须逐字来自正文。",
+        "task": "只根据正文抽取公开人物相关事实，类型限行程、言论、其他；事件只能归属实施动作或发表言论的语法主语，不得归属仅被引用或提及的人物（例如‘以某人论述为指导’中的某人）；同一人物同篇材料已有言论时不要再输出其他。地点应从事件句及相邻句明确公开的场所中提取。未知字段必须为空，证据必须逐字来自正文。",
         "persons": [{"id": p["id"], "name": p["name"], "aliases": p.get("aliases", [])} for p in persons],
         "document": {"title": document["title"], "published_at": document.get("published_at"), "content": document["content_text"][:12000]},
         "output": "JSON object with events array; fields: person_id,event_type,title,summary,start_at,location_name,confirmation_status,confidence,quote_text,evidence_text",
@@ -163,6 +187,7 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
     if not isinstance(parsed.get("events"), list):
         raise ValueError("模型返回缺少 events 数组")
     allowed_person_ids = {p["id"] for p in persons}
+    segments = _content_segments(document["content_text"])
     events = []
     for item in parsed["events"]:
         if item.get("person_id") not in allowed_person_ids or item.get("event_type") not in {"itinerary", "statement", "other"}:
@@ -170,8 +195,14 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
         evidence = str(item.get("evidence_text", ""))
         if not evidence or evidence not in document["content_text"]:
             continue
+        primary_person_id = _primary_person_id(evidence, persons)
+        if primary_person_id is not None and item["person_id"] != primary_person_id:
+            continue
         extracted_title = str(item.get("title") or evidence)
         item["title"] = str(document.get("title") or "未命名材料")[:500]
+        if not item.get("location_name"):
+            segment_index = next((index for index, segment in enumerate(segments) if evidence in segment or segment in evidence), -1)
+            item["location_name"] = _nearby_location(segments, segment_index) if segment_index >= 0 else ""
         if item.get("event_type") == "other" and not item.get("start_at"):
             item["start_at"] = _iso_date("", document.get("published_at"))
         item["review_status"] = "approved" if float(item.get("confidence", 0)) >= float(config.get("review_threshold", 0.7)) else "needs_review"
@@ -184,7 +215,7 @@ def external_extract(document: Dict[str, Any], persons: List[Dict[str, Any]], co
         item.setdefault("speech_context", "")
         item["dedup_key"] = event_dedup_key(item["person_id"], item["event_type"], item.get("start_at"), extracted_title)
         events.append(item)
-    return events
+    return _prefer_statements(events)
 
 
 def extract(document: Dict[str, Any], persons: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:

@@ -331,7 +331,7 @@ const App = {
           <div class="timeline">
             <article v-for="event in data.events" :key="event.id" :class="['timeline-card', event.event_type]" @click="openEvent(event.id)">
               <div class="timeline-date"><strong>{{ formatBeijing(event.start_at).split(' ')[0] }}</strong><span>{{ event.time_precision === 'unknown' ? '时间未知' : '北京时间' }}</span></div>
-              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span class="status">{{ statusLabels[event.review_status] }}</span><span>可信度 {{ percent(event.confidence) }}</span><span>{{ event.evidence_count }} 条证据</span></footer></div>
+              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span class="status">{{ statusLabels[event.review_status] }}</span><span>可信度 {{ percent(event.confidence) }}</span><span>{{ event.source_names || '来源未知' }}</span></footer></div>
             </article>
             <p v-if="!data.events.length" class="empty">这个筛选条件下还没有事件。</p>
           </div>
