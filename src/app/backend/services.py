@@ -15,8 +15,10 @@ from .collectors import (
     collect_source,
     is_chinadaily_url,
 )
+from .config import Settings
 from .database import Database, json_text
 from .extractor import event_core_text, extract, validate_document_evidence_subject
+from .notifications import enqueue_task_run, sanitize_error
 from .security import utc_now
 
 
@@ -131,6 +133,8 @@ def analyze_document(
     document_id: int,
     ai_config: Dict[str, Any],
     stats_out: Optional[Dict[str, Any]] = None,
+    task_run_id: Optional[int] = None,
+    new_event_ids: Optional[List[int]] = None,
 ) -> int:
     document = db.fetch_one(
         "SELECT d.*,s.trust_level FROM raw_documents d JOIN information_sources s ON s.id=d.source_id WHERE d.id=?",
@@ -198,6 +202,13 @@ def analyze_document(
                     ),
                 )
                 event_id = int(cursor.lastrowid)
+                if task_run_id is not None:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO task_run_events(run_id,event_id,created_at) VALUES(?,?,?)",
+                        (task_run_id, event_id, now),
+                    )
+                if new_event_ids is not None:
+                    new_event_ids.append(event_id)
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO event_evidence(event_id,document_id,evidence_text,evidence_locator,supports_fields_json,source_claim_json) "
                 "VALUES(?,?,?,'text',?,?)",
@@ -220,7 +231,8 @@ def add_task_log(db: Database, run_id: int, level: str, message: str, context: O
     )
 
 
-def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> Dict[str, Any]:
+def run_collection_task(db: Database, task_id: int, settings: Settings) -> Dict[str, Any]:
+    config = settings.values
     running = db.fetch_one("SELECT id FROM task_runs WHERE task_id=? AND status='running'", (task_id,))
     if running:
         raise ValueError("该任务已有运行实例")
@@ -245,6 +257,7 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
         "attribution_candidates": 0, "attribution_accepted": 0, "attribution_rejected": 0,
     }
     attribution_reasons: Dict[str, int] = {}
+    new_event_ids: List[int] = []
     error_summary = ""
     status = "success"
     add_task_log(db, run_id, "INFO", "任务开始", {"source": task["source_name"], "correlation_id": correlation_id})
@@ -262,7 +275,10 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
                 if created:
                     counters["created"] += 1
                     analysis_stats: Dict[str, Any] = {}
-                    counters["events"] += analyze_document(db, document_id, config["ai"], analysis_stats)
+                    counters["events"] += analyze_document(
+                        db, document_id, config["ai"], analysis_stats,
+                        task_run_id=run_id, new_event_ids=new_event_ids,
+                    )
                     counters["attribution_candidates"] += int(analysis_stats.get("candidates", 0))
                     counters["attribution_accepted"] += int(analysis_stats.get("accepted", 0))
                     counters["attribution_rejected"] += int(analysis_stats.get("rejected", 0))
@@ -300,8 +316,16 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
             "rejection_reasons": attribution_reasons,
         },
     )
+    notification_counters = {"candidates": 0, "enqueued": 0, "skipped": 0, "batches": 0}
+    try:
+        notification_counters = enqueue_task_run(db, settings, run_id)
+        add_task_log(db, run_id, "INFO", "邮件推送排队统计", notification_counters)
+    except Exception as exc:
+        safe_error = sanitize_error(exc)
+        add_task_log(db, run_id, "ERROR", "邮件推送排队失败", {"error": safe_error})
+        LOGGER.exception("notification enqueue failed for task run %s", run_id)
     return {"run_id": run_id, "status": status, **counters, "error_summary": error_summary,
-            "discovery_stats": task.get("_discovery_stats")}
+            "discovery_stats": task.get("_discovery_stats"), "notifications": notification_counters}
 
 
 def _person_with_aliases(db: Database, person_id: int) -> Optional[Dict[str, Any]]:

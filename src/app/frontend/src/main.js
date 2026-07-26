@@ -32,7 +32,9 @@ const App = {
     const notice = ref('')
     const data = reactive({
       dashboard: null, persons: [], sources: [], tasks: [], runs: [], events: [], eventTotal: 0,
-      selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: []
+      selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: [],
+      notificationConfig: null, notificationRules: [], notificationOptions: { tasks: [], event_types: [] },
+      deliveries: [], deliveryTotal: 0, selectedDelivery: null
     })
     const filters = reactive({
       q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '',
@@ -48,6 +50,16 @@ const App = {
       attribution: { person_id: '', source_id: '', result: null },
       chinadaily: { source_id: '', result: null }
     })
+    const emailForm = reactive({
+      enabled: false, smtp_host: '', smtp_port: 587, security: 'starttls', username: '',
+      password_env: 'PFTS_SMTP_PASSWORD', credential_key_env: 'PFTS_NOTIFICATION_CREDENTIAL_KEY',
+      from_address: '', from_name: '', to_addresses: '', subject_prefix: '[PFTS]',
+      max_events_per_message: 25, worker_poll_seconds: 15, max_attempts: 5,
+      retry_base_seconds: 60, timeout_seconds: 15, password: '', clear_password: false
+    })
+    const ruleForm = reactive({ name: '', task_ids: [], event_types: [], enabled: true })
+    const editingRuleId = ref(null)
+    const deliveryFilters = reactive({ task_id: '', delivery_status: '' })
     const searchTerm = ref('')
     const mapEl = ref(null)
     const mapPersonId = ref('')
@@ -55,7 +67,7 @@ const App = {
 
     const nav = [
       ['dashboard', '总览'], ['timeline', '时间线'], ['persons', '人物'], ['map', '地图'], ['search', '搜索'],
-      ['review', '审核中心'], ['sources', '信息源'], ['tasks', '任务中心'], ['users', '用户权限'],
+      ['review', '审核中心'], ['sources', '信息源'], ['tasks', '任务中心'], ['notifications', '推送管理'], ['users', '用户权限'],
       ['config', '系统配置'], ['audit', '审计日志']
     ]
     const visibleNav = computed(() => nav.filter(([key]) => user.value?.pages?.includes(key)))
@@ -82,6 +94,8 @@ const App = {
         user.value = await api('/auth/me')
         if (!user.value.pages.includes(active.value)) active.value = user.value.pages[0] || 'dashboard'
         await loadPage()
+        const linkedEvent = new URLSearchParams(window.location.search).get('event_id')
+        if (linkedEvent && user.value.pages.includes('timeline')) await openEvent(Number(linkedEvent))
       } catch { user.value = null }
     }
 
@@ -121,6 +135,29 @@ const App = {
           data.tasks = (await api('/tasks')).items
           data.runs = (await api('/task-runs?page_size=30')).items
           if (user.value.role === 'admin') await loadCommon()
+        } else if (active.value === 'notifications') {
+          const [configResult, rulesResult, optionsResult, deliveriesResult] = await Promise.all([
+            api('/notifications/email/config'), api('/notifications/rules'), api('/notifications/options'),
+            api(`/notifications/deliveries?${queryString({ page_size: 50, ...deliveryFilters })}`)
+          ])
+          data.notificationConfig = configResult
+          data.notificationRules = rulesResult.items
+          data.notificationOptions = optionsResult
+          data.deliveries = deliveriesResult.items
+          data.deliveryTotal = deliveriesResult.total
+          const config = configResult.config
+          Object.assign(emailForm, {
+            enabled: Boolean(config.enabled), smtp_host: config.smtp_host || '', smtp_port: config.smtp_port || 587,
+            security: config.security || 'starttls', username: config.username || '',
+            password_env: config.password_env?.environment_variable || 'PFTS_SMTP_PASSWORD',
+            credential_key_env: config.credential_key_env?.environment_variable || 'PFTS_NOTIFICATION_CREDENTIAL_KEY',
+            from_address: config.from_address || '', from_name: config.from_name || '',
+            to_addresses: (config.to_addresses || []).join(', '), subject_prefix: config.subject_prefix || '[PFTS]',
+            max_events_per_message: config.max_events_per_message || 25,
+            worker_poll_seconds: config.worker_poll_seconds || 15, max_attempts: config.max_attempts || 5,
+            retry_base_seconds: config.retry_base_seconds || 60, timeout_seconds: config.timeout_seconds || 15,
+            password: '', clear_password: false
+          })
         } else if (active.value === 'users') {
           const result = await api('/users'); data.users = result.items; data.allPages = result.all_pages
         } else if (active.value === 'config') data.config = (await api('/config/effective')).config
@@ -251,6 +288,108 @@ const App = {
       await perform(async () => { const result = await api(`/tasks/${id}/run`, { method: 'POST' }); flash(`运行完成：${result.status}`); await loadPage() }).catch(() => {})
     }
 
+    async function saveEmailConfig() {
+      const payload = {
+        ...emailForm,
+        smtp_port: Number(emailForm.smtp_port),
+        max_events_per_message: Number(emailForm.max_events_per_message),
+        worker_poll_seconds: Number(emailForm.worker_poll_seconds),
+        max_attempts: Number(emailForm.max_attempts),
+        retry_base_seconds: Number(emailForm.retry_base_seconds),
+        timeout_seconds: Number(emailForm.timeout_seconds),
+        to_addresses: emailForm.to_addresses.split(/[,;，；\n]/).map(value => value.trim()).filter(Boolean),
+        clear_fields: []
+      }
+      await perform(async () => {
+        await api('/notifications/email/config', { method: 'PUT', body: JSON.stringify(payload) })
+        flash('邮件配置已保存')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function resetEmailOverrides() {
+      if (!window.confirm('确定清除页面邮件配置并恢复 app.json / 环境变量配置吗？')) return
+      const clear_fields = [
+        'enabled', 'smtp_host', 'smtp_port', 'security', 'username', 'password_env', 'credential_key_env',
+        'from_address', 'from_name', 'to_addresses', 'subject_prefix', 'max_events_per_message',
+        'worker_poll_seconds', 'max_attempts', 'retry_base_seconds', 'timeout_seconds'
+      ]
+      await perform(async () => {
+        await api('/notifications/email/config', {
+          method: 'PUT', body: JSON.stringify({ clear_fields, clear_password: true })
+        })
+        flash('已恢复文件/环境配置')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function testEmail() {
+      await perform(async () => {
+        const result = await api('/notifications/email/test', { method: 'POST' })
+        flash(result.message || '测试邮件已发送')
+      }).catch(() => {})
+    }
+
+    function resetRuleForm() {
+      Object.assign(ruleForm, { name: '', task_ids: [], event_types: [], enabled: true })
+      editingRuleId.value = null
+    }
+
+    function editRule(rule) {
+      editingRuleId.value = rule.id
+      Object.assign(ruleForm, {
+        name: rule.name, task_ids: [...rule.task_ids], event_types: [...rule.event_types], enabled: Boolean(rule.enabled)
+      })
+    }
+
+    async function saveNotificationRule() {
+      await perform(async () => {
+        const editing = editingRuleId.value
+        await api(editing ? `/notifications/rules/${editing}` : '/notifications/rules', {
+          method: editing ? 'PUT' : 'POST',
+          body: JSON.stringify({
+            ...ruleForm, task_ids: ruleForm.task_ids.map(Number), event_types: [...ruleForm.event_types]
+          })
+        })
+        resetRuleForm()
+        flash(editing ? '推送规则已更新' : '推送规则已创建')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function toggleRule(rule) {
+      await perform(async () => {
+        await api(`/notifications/rules/${rule.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ name: rule.name, task_ids: rule.task_ids, event_types: rule.event_types, enabled: !rule.enabled })
+        })
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function removeRule(rule) {
+      if (!window.confirm(`确定删除推送规则“${rule.name}”吗？历史投递记录会保留。`)) return
+      await perform(async () => {
+        await api(`/notifications/rules/${rule.id}`, { method: 'DELETE' })
+        if (editingRuleId.value === rule.id) resetRuleForm()
+        flash('推送规则已删除')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function openDelivery(id) {
+      await perform(async () => { data.selectedDelivery = await api(`/notifications/deliveries/${id}`) }).catch(() => {})
+    }
+
+    async function retryDelivery(id) {
+      await perform(async () => {
+        await api(`/notifications/deliveries/${id}/retry`, { method: 'POST' })
+        data.selectedDelivery = null
+        flash('失败批次已进入重试队列')
+        await loadPage()
+      }).catch(() => {})
+    }
+
     async function runMaintenance(kind, dryRun) {
       const labels = { attribution: '事件归属重验', chinadaily: '中国日报正文清理' }
       if (!dryRun && !window.confirm(`即将执行“${labels[kind]}”，会修改自动生成且未人工锁定的数据。确认已经完成 SQLite 备份并继续吗？`)) return
@@ -293,9 +432,10 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      maintenance, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      maintenance, emailForm, ruleForm, editingRuleId, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
-      runTask, runMaintenance, review, savePermissions, searchNow
+      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, toggleRule, removeRule,
+      openDelivery, retryDelivery, review, savePermissions, searchNow
     }
   },
   template: `
@@ -428,7 +568,62 @@ const App = {
             </div>
           </section>
           <section class="panel"><table><thead><tr><th>任务</th><th>来源</th><th>周期</th><th>上次运行</th><th>状态</th><th></th></tr></thead><tbody><tr v-for="task in data.tasks" :key="task.id"><td><strong>{{ task.name }}</strong></td><td>{{ task.source_name }}</td><td>{{ task.schedule_seconds }} 秒</td><td>{{ formatBeijing(task.last_run_at) }}</td><td>{{ task.last_status || '未运行' }}</td><td><button class="primary small" @click="runTask(task.id)">立即运行</button></td></tr></tbody></table></section>
-          <section class="panel"><div class="section-title"><h3>最近运行</h3></div><table><thead><tr><th>任务</th><th>开始时间</th><th>状态</th><th>发现/新增/重复</th><th>事件</th><th>失败</th></tr></thead><tbody><tr v-for="run in data.runs" :key="run.id"><td>{{ run.task_name }}</td><td>{{ formatBeijing(run.started_at) }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.discovered_count }}/{{ run.created_count }}/{{ run.duplicate_count }}</td><td>{{ run.event_count }}</td><td>{{ run.failed_count }}</td></tr></tbody></table></section>
+          <section class="panel"><div class="section-title"><h3>最近运行</h3></div><table><thead><tr><th>任务</th><th>开始时间</th><th>状态</th><th>发现/新增/重复</th><th>事件</th><th>邮件</th><th>失败</th></tr></thead><tbody><tr v-for="run in data.runs" :key="run.id"><td>{{ run.task_name }}</td><td>{{ formatBeijing(run.started_at) }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.discovered_count }}/{{ run.created_count }}/{{ run.duplicate_count }}</td><td>{{ run.event_count }}</td><td><button v-if="run.notification_batches && user.pages.includes('notifications')" @click="selectPage('notifications')">{{ run.notification_items }} 项 / {{ run.notification_batches }} 批</button><span v-else>{{ run.notification_items || 0 }}</span><small v-if="run.notification_error" class="delivery-error">{{ run.notification_error }}</small></td><td>{{ run.failed_count }}</td></tr></tbody></table></section>
+        </template>
+
+        <template v-if="active === 'notifications'">
+          <section class="panel notification-summary" v-if="data.notificationConfig">
+            <div class="section-title"><h3>邮件通道</h3><span :class="['status', emailForm.enabled ? 'success' : '']">{{ emailForm.enabled ? '已启用' : '已停用' }}</span></div>
+            <p class="form-hint">页面配置逐字段覆盖 app.json 和环境变量；SMTP 密码始终脱敏。当前密码来源：{{ data.notificationConfig.config.password_source }}</p>
+            <form v-if="user.role==='admin'" class="form-grid notification-form" @submit.prevent="saveEmailConfig">
+              <label class="check-line"><input v-model="emailForm.enabled" type="checkbox" />启用邮件推送</label>
+              <label>SMTP 主机<input v-model="emailForm.smtp_host" placeholder="smtp.example.com" /></label>
+              <label>SMTP 端口<input v-model.number="emailForm.smtp_port" type="number" min="1" max="65535" /></label>
+              <label>连接安全<select v-model="emailForm.security"><option value="starttls">STARTTLS</option><option value="ssl">SMTPS</option><option value="none">无加密</option></select></label>
+              <label>用户名<input v-model="emailForm.username" autocomplete="username" /></label>
+              <label>新 SMTP 密码<input v-model="emailForm.password" type="password" autocomplete="new-password" placeholder="留空则保持原值" /></label>
+              <label>密码环境变量<input v-model="emailForm.password_env" /></label>
+              <label>页面密码主密钥环境变量<input v-model="emailForm.credential_key_env" /></label>
+              <label>发件邮箱<input v-model="emailForm.from_address" type="email" /></label>
+              <label>发件人名称<input v-model="emailForm.from_name" /></label>
+              <label class="span-two">收件邮箱（逗号分隔）<input v-model="emailForm.to_addresses" placeholder="one@example.com, two@example.com" /></label>
+              <label>主题前缀<input v-model="emailForm.subject_prefix" /></label>
+              <label>每封最大事件数<input v-model.number="emailForm.max_events_per_message" type="number" min="1" max="100" /></label>
+              <label>Worker 轮询秒数<input v-model.number="emailForm.worker_poll_seconds" type="number" min="5" /></label>
+              <label>最大尝试次数<input v-model.number="emailForm.max_attempts" type="number" min="1" max="20" /></label>
+              <label>重试基数秒数<input v-model.number="emailForm.retry_base_seconds" type="number" min="1" /></label>
+              <label>SMTP 超时秒数<input v-model.number="emailForm.timeout_seconds" type="number" min="1" max="120" /></label>
+              <label class="check-line"><input v-model="emailForm.clear_password" type="checkbox" />清除页面保存的密码</label>
+              <div class="notification-actions span-two"><button class="primary">保存邮件配置</button><button type="button" @click="testEmail">发送测试邮件</button><button type="button" class="delete-link" @click="resetEmailOverrides">恢复文件配置</button></div>
+            </form>
+            <dl class="config-sources"><div v-for="(source,field) in data.notificationConfig.sources" :key="field"><dt>{{ field }}</dt><dd>{{ source }}</dd></div></dl>
+          </section>
+
+          <section v-if="user.role==='admin'" class="panel form-panel">
+            <div class="section-title"><h3>{{ editingRuleId ? '编辑推送规则' : '新增推送规则' }}</h3><button v-if="editingRuleId" @click="resetRuleForm">取消编辑</button></div>
+            <form class="form-grid notification-form" @submit.prevent="saveNotificationRule">
+              <label>规则名称<input v-model="ruleForm.name" required /></label>
+              <label class="check-line"><input v-model="ruleForm.enabled" type="checkbox" />启用规则</label>
+              <label>采集任务<select v-model="ruleForm.task_ids" multiple required><option v-for="task in data.notificationOptions.tasks" :key="task.id" :value="task.id">{{ task.name }} · {{ task.source_name }}</option></select></label>
+              <fieldset><legend>事件类型</legend><label v-for="type in data.notificationOptions.event_types" :key="type" class="check-line"><input v-model="ruleForm.event_types" type="checkbox" :value="type" />{{ eventLabels[type] }}</label></fieldset>
+              <button class="primary">{{ editingRuleId ? '保存规则' : '创建规则' }}</button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="section-title"><h3>推送规则</h3><span>{{ data.notificationRules.length }} 条</span></div>
+            <table><thead><tr><th>规则</th><th>任务</th><th>事件类型</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
+              <tr v-for="rule in data.notificationRules" :key="rule.id"><td><strong>{{ rule.name }}</strong></td><td>{{ rule.task_ids.map(id => data.notificationOptions.tasks.find(task => task.id===id)?.name || '#'+id).join('、') }}</td><td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td><td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td><td v-if="user.role==='admin'"><div class="table-actions"><button @click="editRule(rule)">编辑</button><button @click="toggleRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeRule(rule)">删除</button></div></td></tr>
+            </tbody></table><p v-if="!data.notificationRules.length" class="empty">尚未创建推送规则。</p>
+          </section>
+
+          <section class="panel">
+            <div class="section-title"><h3>投递记录</h3><span>共 {{ data.deliveryTotal }} 批</span></div>
+            <div class="toolbar notification-toolbar"><select v-model="deliveryFilters.task_id"><option value="">全部任务</option><option v-for="task in data.notificationOptions.tasks" :value="task.id">{{ task.name }}</option></select><select v-model="deliveryFilters.delivery_status"><option value="">全部状态</option><option v-for="status in ['pending','sending','retrying','sent','failed','skipped']" :value="status">{{ status }}</option></select><button @click="loadPage">筛选</button></div>
+            <table><thead><tr><th>时间</th><th>任务</th><th>收件人</th><th>事件</th><th>状态/尝试</th><th>错误</th></tr></thead><tbody>
+              <tr v-for="delivery in data.deliveries" :key="delivery.id" @click="openDelivery(delivery.id)" class="clickable-row"><td>{{ formatBeijing(delivery.created_at) }}</td><td>{{ delivery.task_name }}<small>第 {{ delivery.part_number }} 部分</small></td><td>{{ delivery.recipient }}</td><td>{{ delivery.item_count }}</td><td><span class="status">{{ delivery.status }}</span> / {{ delivery.attempt_count }}</td><td class="delivery-error">{{ delivery.last_error || '—' }}</td></tr>
+            </tbody></table><p v-if="!data.deliveries.length" class="empty">暂无投递记录；规则只会作用于创建后的新任务运行。</p>
+          </section>
         </template>
 
         <template v-if="active === 'map'">
@@ -447,6 +642,7 @@ const App = {
         <template v-if="active === 'audit'"><section class="panel"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>结果</th><th>摘要</th></tr></thead><tbody><tr v-for="item in data.audit" :key="item.id"><td>{{ formatBeijing(item.created_at) }}</td><td>{{ item.username || '系统/未知' }}</td><td>{{ item.action }}</td><td>{{ item.object_type }} #{{ item.object_id }}</td><td>{{ item.result }}</td><td>{{ item.change_summary }}</td></tr></tbody></table></section></template>
 
           <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="primary" @click="review(data.selectedEvent.id,'approve')">通过审核</button><button class="danger" @click="review(data.selectedEvent.id,'reject')">驳回</button></div></section></aside>
+          <aside v-if="data.selectedDelivery" class="detail-overlay" @click.self="data.selectedDelivery=null"><section class="detail-panel"><button class="close" @click="data.selectedDelivery=null">×</button><p class="eyebrow">EMAIL DELIVERY</p><h2>{{ data.selectedDelivery.task_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDelivery.status }}</strong></div><div><small>收件人</small><strong>{{ data.selectedDelivery.recipient }}</strong></div><div><small>创建时间</small><strong>{{ formatBeijing(data.selectedDelivery.created_at) }}</strong></div><div><small>发送时间</small><strong>{{ formatBeijing(data.selectedDelivery.sent_at) }}</strong></div></div><p v-if="data.selectedDelivery.last_error" class="error">{{ data.selectedDelivery.last_error }}</p><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedDelivery.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article><button v-if="user.role==='admin' && data.selectedDelivery.status==='failed'" class="primary" @click="retryDelivery(data.selectedDelivery.id)">重新投递</button></section></aside>
       </section>
     </div>
   `

@@ -18,6 +18,19 @@ from pydantic import BaseModel, Field
 from .collectors import _article_rejection_reason, collect_source
 from .config import Settings, load_config
 from .database import Database, json_text
+from .notifications import (
+    EVENT_TYPES,
+    NotificationWorker,
+    delete_rule,
+    effective_email_config,
+    list_rules,
+    masked_email_config,
+    normalize_email_config,
+    sanitize_error,
+    save_email_overrides,
+    save_rule,
+    send_test_email,
+)
 from .scheduler import Scheduler
 from .security import (
     ALL_PAGES, create_session, current_user, parse_password_file, require_admin, require_page,
@@ -105,6 +118,35 @@ class PermissionBody(BaseModel):
     pages: List[str]
 
 
+class EmailConfigBody(BaseModel):
+    enabled: Optional[bool] = None
+    smtp_host: Optional[str] = Field(default=None, max_length=255)
+    smtp_port: Optional[int] = None
+    security: Optional[str] = None
+    username: Optional[str] = Field(default=None, max_length=300)
+    password_env: Optional[str] = Field(default=None, max_length=200)
+    credential_key_env: Optional[str] = Field(default=None, max_length=200)
+    from_address: Optional[str] = Field(default=None, max_length=320)
+    from_name: Optional[str] = Field(default=None, max_length=200)
+    to_addresses: Optional[List[str]] = None
+    subject_prefix: Optional[str] = Field(default=None, max_length=100)
+    max_events_per_message: Optional[int] = None
+    worker_poll_seconds: Optional[int] = None
+    max_attempts: Optional[int] = None
+    retry_base_seconds: Optional[int] = None
+    timeout_seconds: Optional[int] = None
+    password: str = Field(default="", max_length=1000)
+    clear_password: bool = False
+    clear_fields: List[str] = Field(default_factory=list)
+
+
+class NotificationRuleBody(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    task_ids: List[int]
+    event_types: List[str]
+    enabled: bool = True
+
+
 class CleanupNavigationBody(BaseModel):
     dry_run: bool = True
 
@@ -149,20 +191,26 @@ def _client_ip(request: Request) -> str:
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:
     settings = load_config(config_path)
+    normalize_email_config((settings.get("notifications") or {}).get("email") or {})
     configure_logging(settings)
     db = Database(settings.path("database", "path"), int(settings.get("database", "busy_timeout_ms", 5000)))
     scheduler_holder: Dict[str, Optional[Scheduler]] = {"instance": None}
+    notification_holder: Dict[str, Optional[NotificationWorker]] = {"instance": None}
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         db.initialize()
         sync_users(db, settings.path("security", "password_file"))
+        notification_holder["instance"] = NotificationWorker(db, settings)
+        notification_holder["instance"].start()
         if settings.get("tasks", "scheduler_enabled", False):
-            scheduler_holder["instance"] = Scheduler(db, settings.values)
+            scheduler_holder["instance"] = Scheduler(db, settings)
             scheduler_holder["instance"].start()
         yield
         if scheduler_holder["instance"]:
             scheduler_holder["instance"].stop()
+        if notification_holder["instance"]:
+            notification_holder["instance"].stop()
 
     application = FastAPI(title=settings.get("app", "name"), version="1.0.0", lifespan=lifespan)
     application.state.db = db
@@ -465,7 +513,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @application.post("/api/v1/tasks/{task_id}/run")
     def run_task(task_id: int, request: Request, user: Dict[str, Any] = Depends(require_admin)):
         try:
-            result = run_collection_task(db, task_id, settings.values)
+            result = run_collection_task(db, task_id, settings)
         except ValueError as exc:
             raise HTTPException(409, str(exc))
         audit(db, "run", "task", task_id, user["id"], ip_address=_client_ip(request), summary=result["status"])
@@ -478,7 +526,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         total = int(db.fetch_one("SELECT COUNT(*) n FROM task_runs r " + where, params)["n"])
         params.extend([page_size, (page - 1) * page_size])
         items = db.fetch_all(
-            "SELECT r.*,t.name AS task_name FROM task_runs r JOIN collection_tasks t ON t.id=r.task_id " + where + " ORDER BY r.id DESC LIMIT ? OFFSET ?", params
+            "SELECT r.*,t.name AS task_name,"
+            "(SELECT COUNT(*) FROM email_delivery_batches b WHERE b.task_run_id=r.id) AS notification_batches,"
+            "(SELECT COUNT(*) FROM email_delivery_items i WHERE i.task_run_id=r.id) AS notification_items,"
+            "COALESCE((SELECT b.last_error FROM email_delivery_batches b WHERE b.task_run_id=r.id "
+            "AND b.status='failed' ORDER BY b.id DESC LIMIT 1),'') AS notification_error "
+            "FROM task_runs r JOIN collection_tasks t ON t.id=r.task_id " + where + " ORDER BY r.id DESC LIMIT ? OFFSET ?", params
         )
         return _list_response(items, total, page, page_size)
 
@@ -668,6 +721,191 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @application.get("/api/v1/config/effective")
     def effective_config(user: Dict[str, Any] = Depends(require_page("config"))):
         return {"config": settings.masked(), "config_path": str(settings.config_path), "sources": ["defaults", "app.json", "PFTS_* environment"]}
+
+    @application.get("/api/v1/notifications/email/config")
+    def get_email_config(user: Dict[str, Any] = Depends(require_page("notifications"))):
+        return masked_email_config(settings, db)
+
+    @application.put("/api/v1/notifications/email/config")
+    def update_email_config(
+        body: EmailConfigBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        values = body.model_dump(exclude_unset=True) if hasattr(body, "model_dump") else body.dict(exclude_unset=True)
+        password = str(values.pop("password", "") or "")
+        clear_password = bool(values.pop("clear_password", False))
+        clear_fields = values.pop("clear_fields", []) or []
+        try:
+            config, sources = save_email_overrides(
+                db, settings, values, clear_fields, password, clear_password, int(user["id"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        audit(
+            db, "update", "notification_email_config", 1, user["id"],
+            ip_address=_client_ip(request),
+            summary="更新字段：{}；清除字段：{}；密码操作：{}".format(
+                ",".join(sorted(values)), ",".join(sorted(clear_fields)),
+                "更新" if password else ("清除" if clear_password else "保持"),
+            ),
+        )
+        return masked_email_config(settings, db)
+
+    @application.post("/api/v1/notifications/email/test")
+    def test_email_config(request: Request, user: Dict[str, Any] = Depends(require_admin)):
+        try:
+            send_test_email(settings, db)
+        except Exception as exc:
+            safe = sanitize_error(exc)
+            audit(
+                db, "test", "notification_email", 1, user["id"], result="failed",
+                ip_address=_client_ip(request), summary=safe,
+            )
+            raise HTTPException(502, safe)
+        audit(
+            db, "test", "notification_email", 1, user["id"],
+            ip_address=_client_ip(request), summary="测试邮件已提交给 SMTP 服务",
+        )
+        return {"ok": True, "message": "测试邮件已发送"}
+
+    @application.get("/api/v1/notifications/options")
+    def notification_options(user: Dict[str, Any] = Depends(require_page("notifications"))):
+        return {
+            "tasks": db.fetch_all(
+                "SELECT t.id,t.name,t.enabled,s.name AS source_name FROM collection_tasks t "
+                "JOIN information_sources s ON s.id=t.source_id ORDER BY t.id"
+            ),
+            "event_types": sorted(EVENT_TYPES),
+        }
+
+    @application.get("/api/v1/notifications/rules")
+    def notification_rules(user: Dict[str, Any] = Depends(require_page("notifications"))):
+        items = list_rules(db)
+        return {"items": items, "total": len(items)}
+
+    @application.post("/api/v1/notifications/rules", status_code=201)
+    def create_notification_rule(
+        body: NotificationRuleBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            item = save_rule(db, body.name, body.task_ids, body.event_types, body.enabled)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        audit(
+            db, "create", "notification_rule", item["id"], user["id"],
+            ip_address=_client_ip(request), summary=item["name"],
+        )
+        return item
+
+    @application.put("/api/v1/notifications/rules/{rule_id}")
+    def update_notification_rule(
+        rule_id: int,
+        body: NotificationRuleBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            item = save_rule(db, body.name, body.task_ids, body.event_types, body.enabled, rule_id)
+        except ValueError as exc:
+            status_code = 404 if "不存在" in str(exc) else 422
+            raise HTTPException(status_code, str(exc))
+        audit(
+            db, "update", "notification_rule", item["id"], user["id"],
+            ip_address=_client_ip(request), summary=item["name"],
+        )
+        return item
+
+    @application.delete("/api/v1/notifications/rules/{rule_id}")
+    def remove_notification_rule(
+        rule_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        if not delete_rule(db, rule_id):
+            raise HTTPException(404, "推送规则不存在")
+        audit(
+            db, "delete", "notification_rule", rule_id, user["id"],
+            ip_address=_client_ip(request), summary="删除推送规则",
+        )
+        return {"ok": True, "id": rule_id}
+
+    @application.get("/api/v1/notifications/deliveries")
+    def notification_deliveries(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        task_id: Optional[int] = None,
+        delivery_status: str = "",
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        clauses = []
+        params: List[Any] = []
+        if task_id is not None:
+            clauses.append("r.task_id=?")
+            params.append(task_id)
+        if delivery_status:
+            if delivery_status not in {"pending", "sending", "retrying", "sent", "failed", "skipped"}:
+                raise HTTPException(422, "投递状态无效")
+            clauses.append("b.status=?")
+            params.append(delivery_status)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        base = (
+            " FROM email_delivery_batches b JOIN task_runs r ON r.id=b.task_run_id "
+            "JOIN collection_tasks t ON t.id=r.task_id "
+        )
+        total = int(db.fetch_one("SELECT COUNT(*) n" + base + where, params)["n"])
+        items = db.fetch_all(
+            "SELECT b.*,r.task_id,t.name AS task_name,"
+            "(SELECT COUNT(*) FROM email_delivery_items i WHERE i.batch_id=b.id) AS item_count"
+            + base + where + " ORDER BY b.id DESC LIMIT ? OFFSET ?",
+            params + [page_size, (page - 1) * page_size],
+        )
+        return _list_response(items, total, page, page_size)
+
+    @application.get("/api/v1/notifications/deliveries/{batch_id}")
+    def notification_delivery_detail(
+        batch_id: int,
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        batch = db.fetch_one(
+            "SELECT b.*,r.task_id,t.name AS task_name FROM email_delivery_batches b "
+            "JOIN task_runs r ON r.id=b.task_run_id JOIN collection_tasks t ON t.id=r.task_id WHERE b.id=?",
+            (batch_id,),
+        )
+        if not batch:
+            raise HTTPException(404, "投递批次不存在")
+        batch["items"] = db.fetch_all(
+            "SELECT i.*,e.title,e.event_type,p.name AS person_name FROM email_delivery_items i "
+            "LEFT JOIN timeline_events e ON e.id=i.event_id LEFT JOIN public_figures p ON p.id=e.person_id "
+            "WHERE i.batch_id=? ORDER BY i.id",
+            (batch_id,),
+        )
+        return batch
+
+    @application.post("/api/v1/notifications/deliveries/{batch_id}/retry")
+    def retry_notification_delivery(
+        batch_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        batch = db.fetch_one("SELECT id,status FROM email_delivery_batches WHERE id=?", (batch_id,))
+        if not batch:
+            raise HTTPException(404, "投递批次不存在")
+        if batch["status"] != "failed":
+            raise HTTPException(409, "只有失败批次可以手工重试")
+        now = utc_now()
+        db.execute(
+            "UPDATE email_delivery_batches SET status='retrying',attempt_count=0,next_attempt_at=?,"
+            "last_error='',updated_at=? WHERE id=?",
+            (now, now, batch_id),
+        )
+        audit(
+            db, "retry", "email_delivery_batch", batch_id, user["id"],
+            ip_address=_client_ip(request), summary="手工重试失败邮件批次",
+        )
+        return db.fetch_one("SELECT * FROM email_delivery_batches WHERE id=?", (batch_id,))
 
     @application.get("/api/v1/map/config")
     def map_config(user: Dict[str, Any] = Depends(require_page("map"))):

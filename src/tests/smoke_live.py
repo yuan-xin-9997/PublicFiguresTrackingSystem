@@ -19,6 +19,11 @@ def main() -> int:
         login.raise_for_status()
         dashboard = client.get("/api/v1/dashboard/summary")
         dashboard.raise_for_status()
+        email_config = client.get("/api/v1/notifications/email/config")
+        email_config.raise_for_status()
+        notification_payload = email_config.json()["config"]
+        assert "password" not in notification_payload
+        assert isinstance(notification_payload.get("enabled"), bool)
         print("SMOKE_OK", ready.json()["status"], dashboard.json()["counts"])
     return 0
 

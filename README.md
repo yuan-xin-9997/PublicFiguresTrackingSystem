@@ -16,6 +16,7 @@
 - 行程、动态、言论统一时间线及证据链详情；时间线直接显示具体来源，同篇材料的言论优先于“其他”。
 - 置信度、确认状态、待审核和人工锁定机制。
 - 搜索、地点兼容视图、仪表盘和审计日志。
+- 邮件增量推送：按采集任务和事件类型选择范围，只发送任务本次新建事件，支持持久化重试与投递记录。
 - Windows/Linux 启停脚本和 Jenkins 流水线。
 
 ## 技术架构
@@ -42,6 +43,7 @@
 | 信息源 | 创建、编辑、测试或软删除来源；网站模式自动发现关联人物资讯；也可录入人工材料 |
 | 地图 | 使用 Leaflet 和配置的瓦片服务展示带公开地点坐标的行程；无坐标行程保留为地点卡片 |
 | 任务中心 | 手工运行任务，查看状态、计数和运行记录；管理员可预览并执行事件归属重验及中国日报正文清理 |
+| 推送管理 | 配置邮件通道，维护任务/事件类型规则，测试邮件并查看或重试投递批次 |
 | 用户权限 | 为 `password.txt` 中的普通用户配置可访问页面 |
 | 系统配置 | 查看合并后的生效配置，敏感字段自动脱敏 |
 | 审计日志 | 查询登录、配置、来源、任务和审核等关键操作 |
@@ -78,6 +80,7 @@ PublicFiguresTrackingSystem/
 | `collector` | 集中 WebFetch 地址、API Key 环境变量、缓存/代理策略、超时和直连降级开关 |
 | `ai` | 模型供应方式、兼容接口、模型名、密钥环境变量和审核阈值 |
 | `map` | 地图供应方式、瓦片 URL 和密钥环境变量 |
+| `notifications.email` | SMTP、发件人/收件人、页面密码主密钥引用、邮件分片、Worker 轮询和重试策略 |
 | `logging` | 日志级别、保留天数和路径 |
 
 配置优先级为：代码默认值 < `app.json` < 环境变量。环境变量格式为 `PFTS_区域__字段`，例如：
@@ -87,9 +90,28 @@ PFTS_SERVER__HOST=0.0.0.0
 PFTS_SERVER__PORT=28000
 PFTS_AI_API_KEY=your-secret
 PFTS_WEBFETCH_API_KEY=your-webfetch-api-key
+PFTS_SMTP_PASSWORD=your-smtp-password
+PFTS_NOTIFICATION_CREDENTIAL_KEY=your-fernet-key
 ```
 
 如需外部大模型，将 `ai.provider` 改为非 `local` 值，填写 OpenAI-compatible `base_url` 与 `model`，密钥放入 `ai.api_key_env` 指向的环境变量。外部调用失败时会自动使用本地规则抽取，并记录降级原因。
+
+## 邮件增量推送
+
+邮件推送默认关闭。管理员可在“推送管理”页面配置 SMTP 通道，也可在 `app.json` 的 `notifications.email` 中配置。优先级为：代码默认值 < `app.json` < `PFTS_NOTIFICATIONS__EMAIL__字段` 环境变量 < 页面非空字段；页面可一键清除覆盖并恢复文件/环境配置。
+
+页面保存 SMTP 密码前，必须生成 Fernet 主密钥并通过 `PFTS_NOTIFICATION_CREDENTIAL_KEY` 提供：
+
+```bash
+cd src
+.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+主密钥不得写入仓库或普通备份。也可不在页面保存密码，只把密码放在 `PFTS_SMTP_PASSWORD`，并通过 `password_env` 引用。
+
+推送规则至少选择一个采集任务和一个事件类型（行程、言论或其他）。规则只作用于创建/启用后的任务运行：只有该运行首次创建的事件进入邮件，追加到旧事件的重复材料、人工录入和维护重分析不会触发。多个规则重叠时，同一任务运行、事件和收件人只生成一个投递项。
+
+应用内置持久化邮件 Worker，即使采集调度关闭也会恢复待处理批次。失败按配置指数退避，达到上限后可在页面手工重试。SMTP 采用至少一次投递语义：若 SMTP 已接收邮件但进程在状态写回前异常退出，重试可能再次提交相同稳定 `Message-ID`。
 
 ## 集中网页抓取服务
 
@@ -241,6 +263,8 @@ cd src
 - 下载归档：`src/data/downloads/YYYY/MM/DD/`。
 
 备份至少应包含 `data/app.sqlite3`、`data/downloads/`、`config/app.json` 和受保护的 `data/password.txt`。复制正在写入的 SQLite 前应停止服务，或使用 SQLite Backup API。
+
+SQLite 备份中的页面 SMTP 密码是密文。`PFTS_NOTIFICATION_CREDENTIAL_KEY` 必须独立安全保存；密钥丢失时只能清除页面密码并重新录入。轮换主密钥前先记录 SMTP 密码，在页面清除旧密文、替换环境密钥后再保存。邮件失败不会回滚采集结果，可在“推送管理 → 投递记录”查看安全错误摘要。
 
 ### 数据质量维护
 

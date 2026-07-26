@@ -46,6 +46,26 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "attribution": "© OpenStreetMap contributors", "default_center": [35.0, 105.0], "default_zoom": 3,
         "api_key_env": "PFTS_MAP_API_KEY",
     },
+    "notifications": {
+        "email": {
+            "enabled": False,
+            "smtp_host": "",
+            "smtp_port": 587,
+            "security": "starttls",
+            "username": "",
+            "password_env": "PFTS_SMTP_PASSWORD",
+            "credential_key_env": "PFTS_NOTIFICATION_CREDENTIAL_KEY",
+            "from_address": "",
+            "from_name": "",
+            "to_addresses": [],
+            "subject_prefix": "[PFTS]",
+            "max_events_per_message": 25,
+            "worker_poll_seconds": 15,
+            "max_attempts": 5,
+            "retry_base_seconds": 60,
+            "timeout_seconds": 15,
+        }
+    },
     "logging": {"level": "INFO", "retention_days": 30, "path": "logs/app.log"},
 }
 
@@ -67,13 +87,37 @@ def _parse_env_value(value: str) -> Any:
     try:
         return int(value)
     except ValueError:
-        return value
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+
+
+def _mark_sources(value: Any, prefix: str, source: str, output: Dict[str, str]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _mark_sources(child, "{}.{}".format(prefix, key) if prefix else key, source, output)
+    else:
+        output[prefix] = source
+
+
+def _set_nested(values: Dict[str, Any], parts: list, value: Any) -> bool:
+    target: Any = values
+    for part in parts[:-1]:
+        if not isinstance(target, dict) or part not in target or not isinstance(target[part], dict):
+            return False
+        target = target[part]
+    if not isinstance(target, dict):
+        return False
+    target[parts[-1]] = value
+    return True
 
 
 class Settings:
-    def __init__(self, values: Dict[str, Any], config_path: Path):
+    def __init__(self, values: Dict[str, Any], config_path: Path, sources: Optional[Dict[str, str]] = None):
         self.values = values
         self.config_path = config_path
+        self.sources = sources or {}
         self.src_root = config_path.parent.parent if config_path.parent.name == "config" else SRC_ROOT
 
     def get(self, section: str, key: Optional[str] = None, default: Any = None) -> Any:
@@ -87,6 +131,9 @@ class Settings:
     def path(self, section: str, key: str) -> Path:
         raw = Path(str(self.get(section, key)))
         return raw if raw.is_absolute() else (self.src_root / raw).resolve()
+
+    def source(self, *parts: str, default: str = "default") -> str:
+        return self.sources.get(".".join(parts), default)
 
     def masked(self) -> Dict[str, Any]:
         sensitive = ("password", "secret", "token", "key", "cookie")
@@ -109,18 +156,22 @@ def load_config(config_path: Optional[str] = None) -> Settings:
     configured = config_path or os.getenv("PFTS_CONFIG")
     path = Path(configured).resolve() if configured else (SRC_ROOT / "config" / "app.json")
     values = deepcopy(DEFAULT_CONFIG)
+    sources: Dict[str, str] = {}
+    _mark_sources(values, "", "default", sources)
     if path.exists():
         with path.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
         if not isinstance(loaded, dict):
             raise ValueError("app.json 顶层必须是 JSON 对象")
         values = _deep_merge(values, loaded)
+        _mark_sources(loaded, "", "app.json", sources)
 
     for env_name, env_value in os.environ.items():
-        if not env_name.startswith("PFTS_") or env_name in {"PFTS_CONFIG", "PFTS_AI_API_KEY", "PFTS_MAP_API_KEY"}:
+        if not env_name.startswith("PFTS_") or "__" not in env_name:
             continue
         parts = env_name[5:].lower().split("__")
-        if len(parts) != 2 or parts[0] not in values:
+        if len(parts) < 2 or parts[0] not in values:
             continue
-        values.setdefault(parts[0], {})[parts[1]] = _parse_env_value(env_value)
-    return Settings(values, path)
+        if _set_nested(values, parts, _parse_env_value(env_value)):
+            sources[".".join(parts)] = "environment"
+    return Settings(values, path, sources)

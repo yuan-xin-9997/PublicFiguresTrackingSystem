@@ -13,7 +13,7 @@ from .database import Database
 
 ALL_PAGES = [
     "dashboard", "persons", "timeline", "map", "search", "review", "sources",
-    "tasks", "users", "config", "audit",
+    "tasks", "notifications", "users", "config", "audit",
 ]
 DEFAULT_USER_PAGES = ["dashboard", "persons", "timeline", "map", "search"]
 
@@ -149,4 +149,3 @@ def require_admin(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any
     if user["role"] != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅管理员可执行此操作")
     return user
-

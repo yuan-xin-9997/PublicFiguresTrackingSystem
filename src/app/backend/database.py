@@ -224,6 +224,65 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC);
+CREATE TABLE IF NOT EXISTS notification_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    overrides_json TEXT NOT NULL DEFAULT '{}',
+    password_ciphertext TEXT NOT NULL DEFAULT '',
+    updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_rule_tasks (
+    rule_id INTEGER NOT NULL REFERENCES notification_rules(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES collection_tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY(rule_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_rule_tasks_task ON notification_rule_tasks(task_id, rule_id);
+CREATE TABLE IF NOT EXISTS task_run_events (
+    run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL REFERENCES timeline_events(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_event ON task_run_events(event_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_created ON task_run_events(created_at);
+CREATE TABLE IF NOT EXISTS email_delivery_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    part_number INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','retrying','sent','failed','skipped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(task_run_id, recipient, part_number)
+);
+CREATE INDEX IF NOT EXISTS idx_email_batches_due ON email_delivery_batches(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_email_batches_task ON email_delivery_batches(task_run_id, id);
+CREATE TABLE IF NOT EXISTS email_delivery_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES email_delivery_batches(id) ON DELETE CASCADE,
+    task_run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    event_id INTEGER REFERENCES timeline_events(id) ON DELETE SET NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','skipped')),
+    skip_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(task_run_id, event_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_email_items_batch ON email_delivery_items(batch_id, id);
 """
 
 
@@ -335,6 +394,10 @@ class Database:
                 """)
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(3, datetime('now'))"
+                )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=4").fetchone():
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(4, datetime('now'))"
                 )
 
     @contextmanager
