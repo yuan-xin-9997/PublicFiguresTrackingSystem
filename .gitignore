@@ -158,6 +158,7 @@ env.bak/
 venv.bak/
 
 # Project runtime and frontend dependencies
+.DS_Store
 src/logs/
 src/app/frontend/node_modules/
 src/data/*.sqlite3
