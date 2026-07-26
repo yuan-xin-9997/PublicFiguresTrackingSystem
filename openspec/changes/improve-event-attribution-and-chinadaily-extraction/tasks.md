@@ -58,5 +58,5 @@
 
 - [x] 9.1 检查并按需更新 `src/JenkinsConfig/Jenkinsfile`，确保流水线运行新增后端、前端、构建、迁移和烟雾测试
 - [x] 9.2 在 Linux 验证 `start.sh`、`status.sh`、`stop.sh`，并在可用的 Windows/Jenkins 环境验证对应 PowerShell 脚本或流水线步骤
-- [ ] 9.3 部署前备份生产 SQLite，部署后先运行 dry-run 并人工核对反例，再执行存量修复和来源重分析
-- [ ] 9.4 提交并推送 GitHub 后手动触发 Jenkins 构建，确认成功，再请用户访问 `persontracking.yuan-xin.top` 验证习近平时间线与中国日报文章结果
+- [x] 9.3 部署前备份生产 SQLite，部署后先运行 dry-run 并人工核对反例，再执行存量修复和来源重分析
+- [x] 9.4 提交并推送 GitHub 后手动触发 Jenkins 构建，确认成功，再请用户访问 `persontracking.yuan-xin.top` 验证习近平时间线与中国日报文章结果
