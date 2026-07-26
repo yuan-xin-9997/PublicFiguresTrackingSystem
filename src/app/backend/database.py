@@ -245,6 +245,13 @@ CREATE TABLE IF NOT EXISTS notification_rule_tasks (
     PRIMARY KEY(rule_id, task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_notification_rule_tasks_task ON notification_rule_tasks(task_id, rule_id);
+CREATE TABLE IF NOT EXISTS notification_rule_persons (
+    rule_id INTEGER NOT NULL REFERENCES notification_rules(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES public_figures(id) ON DELETE CASCADE,
+    PRIMARY KEY(rule_id, person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_rule_persons_person
+    ON notification_rule_persons(person_id, rule_id);
 CREATE TABLE IF NOT EXISTS task_run_events (
     run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
     event_id INTEGER NOT NULL REFERENCES timeline_events(id) ON DELETE CASCADE,
@@ -398,6 +405,10 @@ class Database:
             if not connection.execute("SELECT 1 FROM schema_version WHERE version=4").fetchone():
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(4, datetime('now'))"
+                )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=5").fetchone():
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(5, datetime('now'))"
                 )
 
     @contextmanager

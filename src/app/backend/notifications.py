@@ -231,6 +231,12 @@ def list_rules(db: Database) -> List[Dict[str, Any]]:
                 "SELECT task_id FROM notification_rule_tasks WHERE rule_id=? ORDER BY task_id", (rule["id"],)
             )
         ]
+        rule["person_ids"] = [
+            row["person_id"] for row in db.fetch_all(
+                "SELECT person_id FROM notification_rule_persons WHERE rule_id=? ORDER BY person_id",
+                (rule["id"],),
+            )
+        ]
         rule["enabled"] = bool(rule["enabled"])
     return rules
 
@@ -242,12 +248,14 @@ def save_rule(
     event_types: Iterable[str],
     enabled: bool,
     rule_id: Optional[int] = None,
+    person_ids: Optional[Iterable[int]] = None,
 ) -> Dict[str, Any]:
     clean_name = str(name or "").strip()
     if not clean_name or len(clean_name) > 200:
         raise ValueError("规则名称不能为空且不能超过 200 个字符")
     clean_tasks = sorted(set(int(value) for value in task_ids))
     clean_types = sorted(set(str(value) for value in event_types))
+    clean_persons = sorted(set(int(value) for value in (person_ids or [])))
     if not clean_tasks:
         raise ValueError("至少选择一个采集任务")
     if not clean_types or any(value not in EVENT_TYPES for value in clean_types):
@@ -258,6 +266,15 @@ def save_rule(
     )
     if len(found) != len(clean_tasks):
         raise ValueError("包含不存在的采集任务")
+    if clean_persons:
+        found_persons = db.fetch_all(
+            "SELECT id FROM public_figures WHERE enabled=1 AND deleted_at IS NULL AND id IN ({})".format(
+                ",".join("?" for _ in clean_persons)
+            ),
+            clean_persons,
+        )
+        if len(found_persons) != len(clean_persons):
+            raise ValueError("包含不存在或不可用的人物")
     now = utc_now()
     with db.transaction() as connection:
         if rule_id is None:
@@ -274,9 +291,14 @@ def save_rule(
             if not cursor.rowcount:
                 raise ValueError("推送规则不存在")
             connection.execute("DELETE FROM notification_rule_tasks WHERE rule_id=?", (rule_id,))
+            connection.execute("DELETE FROM notification_rule_persons WHERE rule_id=?", (rule_id,))
         connection.executemany(
             "INSERT INTO notification_rule_tasks(rule_id,task_id) VALUES(?,?)",
             [(rule_id, task_id) for task_id in clean_tasks],
+        )
+        connection.executemany(
+            "INSERT INTO notification_rule_persons(rule_id,person_id) VALUES(?,?)",
+            [(rule_id, person_id) for person_id in clean_persons],
         )
     return next(rule for rule in list_rules(db) if int(rule["id"]) == rule_id)
 
@@ -301,25 +323,44 @@ def enqueue_task_run(db: Database, settings: Settings, run_id: int) -> Dict[str,
     if not run:
         raise ValueError("任务运行不存在")
     rule_rows = db.fetch_all(
-        "SELECT r.event_types_json FROM notification_rules r "
+        "SELECT r.id,r.event_types_json FROM notification_rules r "
         "JOIN notification_rule_tasks rt ON rt.rule_id=r.id WHERE r.enabled=1 AND rt.task_id=?",
         (run["task_id"],),
     )
-    allowed_types = set()
+    matchers = []
     for row in rule_rows:
         try:
-            allowed_types.update(value for value in json.loads(row["event_types_json"]) if value in EVENT_TYPES)
+            allowed_types = {
+                value for value in json.loads(row["event_types_json"]) if value in EVENT_TYPES
+            }
         except (TypeError, ValueError):
             continue
-    if not allowed_types:
+        if not allowed_types:
+            continue
+        persons = {
+            int(item["person_id"]) for item in db.fetch_all(
+                "SELECT person_id FROM notification_rule_persons WHERE rule_id=?",
+                (row["id"],),
+            )
+        }
+        matchers.append((allowed_types, persons))
+    if not matchers:
         return counters
-    placeholders = ",".join("?" for _ in allowed_types)
     events = db.fetch_all(
-        "SELECT tre.event_id FROM task_run_events tre JOIN timeline_events e ON e.id=tre.event_id "
-        "WHERE tre.run_id=? AND e.event_type IN ({}) ORDER BY tre.event_id".format(placeholders),
-        [run_id] + sorted(allowed_types),
+        "SELECT tre.event_id,e.event_type,e.person_id FROM task_run_events tre "
+        "JOIN timeline_events e ON e.id=tre.event_id "
+        "JOIN public_figures p ON p.id=e.person_id "
+        "WHERE tre.run_id=? AND p.enabled=1 AND p.deleted_at IS NULL ORDER BY tre.event_id",
+        (run_id,),
     )
-    event_ids = [int(row["event_id"]) for row in events]
+    event_ids = [
+        int(row["event_id"]) for row in events
+        if any(
+            row["event_type"] in allowed_types
+            and (not person_ids or int(row["person_id"]) in person_ids)
+            for allowed_types, person_ids in matchers
+        )
+    ]
     counters["candidates"] = len(event_ids)
     if not event_ids:
         return counters

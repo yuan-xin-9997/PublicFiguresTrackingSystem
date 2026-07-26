@@ -38,12 +38,20 @@ The system MUST protect SMTP credentials at rest, in transit, in APIs, logs, aud
 - **WHEN** any authorized user reads email configuration or delivery errors
 - **THEN** the response exposes only masked values, configured-state indicators, safe error summaries, and per-field configuration sources
 
-### Requirement: Task and event type push rules
-The system SHALL allow administrators to create, update, enable, disable, and delete push rules that select one or more existing collection tasks and one or more supported event types.
+### Requirement: Task, person, and event type push rules
+The system SHALL allow administrators to create, update, enable, disable, and delete push rules that select one or more existing collection tasks, optionally select one or more people, and select one or more supported event types.
 
 #### Scenario: Create a valid rule
-- **WHEN** an administrator selects enabled or disabled collection tasks, selects at least one of `itinerary`, `statement`, or `other`, names the rule, and saves it
-- **THEN** the system persists the rule and its exact task and event type selections
+- **WHEN** an administrator selects enabled or disabled collection tasks, optionally selects people, selects at least one of `itinerary`, `statement`, or `other`, names the rule, and saves it
+- **THEN** the system persists the rule and its exact task, person, and event type selections
+
+#### Scenario: No person selection means all people
+- **WHEN** an administrator saves a valid rule without selecting any person
+- **THEN** the rule matches events for every currently available person and the rule view clearly displays an all-people scope
+
+#### Scenario: Select specific people
+- **WHEN** an administrator selects one or more people in a valid rule
+- **THEN** the rule matches only events whose person is in that exact selection
 
 #### Scenario: Reject an empty selection
 - **WHEN** a rule contains no task or no event type
@@ -57,8 +65,16 @@ The system SHALL allow administrators to create, update, enable, disable, and de
 - **WHEN** a selected collection task is deleted through an allowed cascade or becomes unavailable
 - **THEN** the rule no longer matches that task and existing delivery history remains queryable
 
+#### Scenario: Existing rule migration
+- **WHEN** a rule created before person filtering is upgraded to the new schema
+- **THEN** it has no person associations and continues to match all people without changing its task or event type selections
+
+#### Scenario: Person becomes unavailable
+- **WHEN** a selected person is deleted, disabled, or otherwise unavailable
+- **THEN** the rule no longer matches new events for that person and existing delivery history remains queryable
+
 ### Requirement: Incremental event selection
-The system SHALL enqueue only events first created by a collection task run after an applicable rule is enabled and whose event type matches that rule.
+The system SHALL enqueue only events first created by a collection task run after an applicable rule is enabled and whose event type and person scope match that rule.
 
 #### Scenario: New matching event
 - **WHEN** a selected task run creates a new timeline event whose type is selected by an enabled rule
@@ -70,6 +86,10 @@ The system SHALL enqueue only events first created by a collection task run afte
 
 #### Scenario: Non-matching event type
 - **WHEN** a selected task creates an event whose type is not selected by any enabled rule for that task
+- **THEN** the system does not enqueue that event
+
+#### Scenario: Non-matching person
+- **WHEN** a selected task creates an event for a person outside every matching rule's selected person scope
 - **THEN** the system does not enqueue that event
 
 #### Scenario: Rule enabled after a run
@@ -154,7 +174,7 @@ The system MUST integrate push management with existing login, page permission, 
 
 #### Scenario: Authorized ordinary user views status
 - **WHEN** an ordinary user has the `notifications` page permission
-- **THEN** the user can view masked channel health, rule summaries, and paginated delivery history
+- **THEN** the user can view masked channel health, task/person/event-type rule summaries, and paginated delivery history
 
 #### Scenario: Ordinary user attempts a write
 - **WHEN** an ordinary user calls a configuration, rule mutation, test-send, or retry endpoint

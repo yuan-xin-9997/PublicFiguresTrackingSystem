@@ -33,7 +33,7 @@ const App = {
     const data = reactive({
       dashboard: null, persons: [], sources: [], tasks: [], runs: [], events: [], eventTotal: 0,
       selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: [],
-      notificationConfig: null, notificationRules: [], notificationOptions: { tasks: [], event_types: [] },
+      notificationConfig: null, notificationRules: [], notificationOptions: { tasks: [], persons: [], event_types: [] },
       deliveries: [], deliveryTotal: 0, selectedDelivery: null
     })
     const filters = reactive({
@@ -57,8 +57,9 @@ const App = {
       max_events_per_message: 25, worker_poll_seconds: 15, max_attempts: 5,
       retry_base_seconds: 60, timeout_seconds: 15, password: '', clear_password: false
     })
-    const ruleForm = reactive({ name: '', task_ids: [], event_types: [], enabled: true })
+    const ruleForm = reactive({ name: '', task_ids: [], person_ids: [], event_types: [], enabled: true })
     const editingRuleId = ref(null)
+    const rulePersonSearch = ref('')
     const deliveryFilters = reactive({ task_id: '', delivery_status: '' })
     const searchTerm = ref('')
     const mapEl = ref(null)
@@ -72,6 +73,15 @@ const App = {
     ]
     const visibleNav = computed(() => nav.filter(([key]) => user.value?.pages?.includes(key)))
     const manualSources = computed(() => data.sources.filter(source => source.type === 'manual'))
+    const visibleRulePersons = computed(() => {
+      const query = rulePersonSearch.value.trim().toLowerCase()
+      if (!query) return data.notificationOptions.persons
+      return data.notificationOptions.persons.filter(person =>
+        [person.name, person.organization, person.title].some(value =>
+          String(value || '').toLowerCase().includes(query)
+        )
+      )
+    })
 
     function flash(message) {
       notice.value = message
@@ -331,7 +341,8 @@ const App = {
     }
 
     function resetRuleForm() {
-      Object.assign(ruleForm, { name: '', task_ids: [], event_types: [], enabled: true })
+      Object.assign(ruleForm, { name: '', task_ids: [], person_ids: [], event_types: [], enabled: true })
+      rulePersonSearch.value = ''
       editingRuleId.value = null
     }
 
@@ -343,10 +354,19 @@ const App = {
       ruleForm.task_ids = []
     }
 
+    function selectAllRulePersons() {
+      ruleForm.person_ids = data.notificationOptions.persons.map(person => Number(person.id))
+    }
+
+    function clearRulePersons() {
+      ruleForm.person_ids = []
+    }
+
     function editRule(rule) {
       editingRuleId.value = rule.id
       Object.assign(ruleForm, {
-        name: rule.name, task_ids: [...rule.task_ids], event_types: [...rule.event_types], enabled: Boolean(rule.enabled)
+        name: rule.name, task_ids: [...rule.task_ids], person_ids: [...(rule.person_ids || [])],
+        event_types: [...rule.event_types], enabled: Boolean(rule.enabled)
       })
     }
 
@@ -356,7 +376,8 @@ const App = {
         await api(editing ? `/notifications/rules/${editing}` : '/notifications/rules', {
           method: editing ? 'PUT' : 'POST',
           body: JSON.stringify({
-            ...ruleForm, task_ids: ruleForm.task_ids.map(Number), event_types: [...ruleForm.event_types]
+            ...ruleForm, task_ids: ruleForm.task_ids.map(Number),
+            person_ids: ruleForm.person_ids.map(Number), event_types: [...ruleForm.event_types]
           })
         })
         resetRuleForm()
@@ -369,7 +390,10 @@ const App = {
       await perform(async () => {
         await api(`/notifications/rules/${rule.id}`, {
           method: 'PUT',
-          body: JSON.stringify({ name: rule.name, task_ids: rule.task_ids, event_types: rule.event_types, enabled: !rule.enabled })
+          body: JSON.stringify({
+            name: rule.name, task_ids: rule.task_ids, person_ids: rule.person_ids || [],
+            event_types: rule.event_types, enabled: !rule.enabled
+          })
         })
         await loadPage()
       }).catch(() => {})
@@ -440,9 +464,9 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      maintenance, emailForm, ruleForm, editingRuleId, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      maintenance, emailForm, ruleForm, editingRuleId, rulePersonSearch, visibleRulePersons, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
-      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, toggleRule, removeRule,
+      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, selectAllRulePersons, clearRulePersons, toggleRule, removeRule,
       openDelivery, retryDelivery, review, savePermissions, searchNow
     }
   },
@@ -623,6 +647,19 @@ const App = {
                 </div>
                 <p v-if="!data.notificationOptions.tasks.length" class="form-hint">暂无可选采集任务，请先在信息源页面创建任务。</p>
               </fieldset>
+              <fieldset class="task-picker person-picker span-two">
+                <legend>人物范围（已选择 {{ ruleForm.person_ids.length }} 人）</legend>
+                <div class="task-picker-actions"><button type="button" @click="selectAllRulePersons">全选</button><button type="button" @click="clearRulePersons">清空</button></div>
+                <input v-model="rulePersonSearch" class="person-search" type="search" placeholder="搜索人物、机构或职务" />
+                <div class="task-option-grid person-option-grid">
+                  <label v-for="person in visibleRulePersons" :key="person.id" class="task-option">
+                    <input v-model="ruleForm.person_ids" type="checkbox" :value="person.id" />
+                    <span><strong>{{ person.name }}</strong><small>{{ [person.organization, person.title].filter(Boolean).join(' · ') || '暂无机构或职务' }}</small></span>
+                  </label>
+                </div>
+                <p v-if="!ruleForm.person_ids.length" class="form-hint person-scope-hint">未选择人物时匹配全部人物。</p>
+                <p v-else-if="!visibleRulePersons.length" class="form-hint person-scope-hint">没有符合搜索条件的人物。</p>
+              </fieldset>
               <fieldset><legend>事件类型</legend><label v-for="type in data.notificationOptions.event_types" :key="type" class="check-line"><input v-model="ruleForm.event_types" type="checkbox" :value="type" />{{ eventLabels[type] }}</label></fieldset>
               <button class="primary">{{ editingRuleId ? '保存规则' : '创建规则' }}</button>
             </form>
@@ -630,8 +667,8 @@ const App = {
 
           <section class="panel">
             <div class="section-title"><h3>推送规则</h3><span>{{ data.notificationRules.length }} 条</span></div>
-            <table><thead><tr><th>规则</th><th>任务</th><th>事件类型</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
-              <tr v-for="rule in data.notificationRules" :key="rule.id"><td><strong>{{ rule.name }}</strong></td><td>{{ rule.task_ids.map(id => data.notificationOptions.tasks.find(task => task.id===id)?.name || '#'+id).join('、') }}</td><td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td><td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td><td v-if="user.role==='admin'"><div class="table-actions"><button @click="editRule(rule)">编辑</button><button @click="toggleRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeRule(rule)">删除</button></div></td></tr>
+            <table><thead><tr><th>规则</th><th>任务</th><th>人物</th><th>事件类型</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
+              <tr v-for="rule in data.notificationRules" :key="rule.id"><td><strong>{{ rule.name }}</strong></td><td>{{ rule.task_ids.map(id => data.notificationOptions.tasks.find(task => task.id===id)?.name || '#'+id).join('、') }}</td><td>{{ !rule.person_ids?.length ? '全部人物' : rule.person_ids.map(id => data.notificationOptions.persons.find(person => person.id===id)?.name || '#'+id).join('、') }}</td><td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td><td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td><td v-if="user.role==='admin'"><div class="table-actions"><button @click="editRule(rule)">编辑</button><button @click="toggleRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeRule(rule)">删除</button></div></td></tr>
             </tbody></table><p v-if="!data.notificationRules.length" class="empty">尚未创建推送规则。</p>
           </section>
 

@@ -29,6 +29,16 @@ describe('email notification management UI', () => {
     expect(styles).toContain('.task-option-grid')
   })
 
+  it('supports searchable optional person selection with all-person compatibility', () => {
+    expect(source).toContain('v-model="ruleForm.person_ids" type="checkbox"')
+    expect(source).toContain('v-model="rulePersonSearch"')
+    expect(source).toContain('@click="selectAllRulePersons"')
+    expect(source).toContain('@click="clearRulePersons"')
+    expect(source).toContain('未选择人物时匹配全部人物')
+    expect(source).toContain("'全部人物'")
+    expect(styles).toContain('.person-option-grid')
+  })
+
   it('provides responsive notification layout and status feedback', () => {
     expect(styles).toContain('.notification-form')
     expect(styles).toContain('.config-sources')

@@ -143,6 +143,7 @@ class EmailConfigBody(BaseModel):
 class NotificationRuleBody(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     task_ids: List[int]
+    person_ids: List[int] = Field(default_factory=list)
     event_types: List[str]
     enabled: bool = True
 
@@ -776,6 +777,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 "SELECT t.id,t.name,t.enabled,s.name AS source_name FROM collection_tasks t "
                 "JOIN information_sources s ON s.id=t.source_id ORDER BY t.id"
             ),
+            "persons": db.fetch_all(
+                "SELECT id,name,organization,title FROM public_figures "
+                "WHERE enabled=1 AND deleted_at IS NULL ORDER BY name,id"
+            ),
             "event_types": sorted(EVENT_TYPES),
         }
 
@@ -791,7 +796,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         user: Dict[str, Any] = Depends(require_admin),
     ):
         try:
-            item = save_rule(db, body.name, body.task_ids, body.event_types, body.enabled)
+            item = save_rule(
+                db, body.name, body.task_ids, body.event_types, body.enabled,
+                person_ids=body.person_ids,
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         audit(
@@ -808,7 +816,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         user: Dict[str, Any] = Depends(require_admin),
     ):
         try:
-            item = save_rule(db, body.name, body.task_ids, body.event_types, body.enabled, rule_id)
+            item = save_rule(
+                db, body.name, body.task_ids, body.event_types, body.enabled,
+                rule_id=rule_id, person_ids=body.person_ids,
+            )
         except ValueError as exc:
             status_code = 404 if "不存在" in str(exc) else 422
             raise HTTPException(status_code, str(exc))
