@@ -401,8 +401,6 @@ def _article_rejection_reason(document: Dict[str, Any]) -> str:
             return "中国日报标题包含页面导航"
         if china_content_markers >= 5:
             return "中国日报正文仍含密集页面导航"
-        if title and content.count(title) >= 3:
-            return "中国日报正文重复页面标题"
     # A flattened portal page often repeats many navigation labels in both its
     # extracted title and body, even when the generic article adapter returns data.
     content_marker_count = sum(1 for marker in NAVIGATION_TITLE_MARKERS if marker in content[:1200])

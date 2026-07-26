@@ -315,3 +315,19 @@ def test_chinadaily_quality_rejects_channels_but_not_other_site_reprints():
         "转载中国日报：公开合作消息 正文第一段内容完整。正文第二段继续介绍公开事实。",
     )
     assert reprint.startswith("转载中国日报")
+
+
+def test_chinadaily_photo_story_allows_title_phrase_in_multiple_captions():
+    title = "习近平在上海考察"
+    content = " ".join([
+        title,
+        "7月15日，习近平在上海考察。这是习近平在居民区考察时同工作人员交流。新华社记者甲摄。",
+        "7月15日，习近平在上海考察。这是习近平来到居民家中了解情况。新华社记者乙摄。",
+        "7月15日，习近平在上海考察。这是习近平同居民代表亲切交流。新华社记者丙摄。",
+    ])
+    assert not _article_rejection_reason({
+        "canonical_url": "https://cn.chinadaily.com.cn/a/202607/15/WS123456.html",
+        "title": title,
+        "published_at": "2026-07-15T18:00:00+08:00",
+        "content_text": content,
+    })
