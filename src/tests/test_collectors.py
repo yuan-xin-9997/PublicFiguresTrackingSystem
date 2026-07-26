@@ -272,6 +272,35 @@ def test_chinadaily_article_removes_homepage_prefix_and_recommendations():
     assert "习近平表示" in cleaned
 
 
+def test_chinadaily_article_removes_flattened_toolbar_between_deck_and_body():
+    title = "万山磅礴看主峰｜习近平谈亚太合作"
+    deck = "多年来，习近平主席提出一系列倡议与主张。"
+    content = (
+        title + " " + deck
+        + " 站内搜索 搜狗搜索 中国搜索 订阅 移动 English 首页 时政 时政要闻 "
+        + "评论频道 理论频道 学习时代 两岸频道 资讯 独家 中国日报专稿 "
+        + "传媒动态 每日一词 法院公告 C财经 科技 视频 专栏 漫画 观天下 "
+        + "地方 文创 文旅 文化知识库 中国有约 China Daily Homepage 中文网首页 "
+        + "关闭 中国日报网 > 要闻 > " + title
+        + " 来源：公开来源 2026-07-25 09:18 分享到微信 "
+        + deck + "这是文章正文第二段，介绍亚太合作的公开信息。 【"
+    )
+
+    cleaned = clean_article_content(
+        "https://cn.chinadaily.com.cn/a/202607/25/WS123456.html", title, content,
+    )
+
+    assert cleaned == title + " " + deck + " " + deck + "这是文章正文第二段，介绍亚太合作的公开信息。"
+    assert "站内搜索" not in cleaned
+    assert "中国日报网 >" not in cleaned
+    assert not _article_rejection_reason({
+        "canonical_url": "https://cn.chinadaily.com.cn/a/202607/25/WS123456.html",
+        "title": title,
+        "published_at": "2026-07-25T09:18:00+08:00",
+        "content_text": cleaned,
+    })
+
+
 def test_chinadaily_quality_rejects_channels_but_not_other_site_reprints():
     channel = {
         "canonical_url": "https://cn.chinadaily.com.cn/china/",

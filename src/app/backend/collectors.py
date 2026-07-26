@@ -122,6 +122,15 @@ def _clean_chinadaily_content(title: str, content: str) -> str:
         duplicate = article_title + " " + article_title
         while clean.startswith(duplicate):
             clean = clean[len(article_title):].lstrip()
+    # The generic.article adapter can flatten China Daily's page chrome between
+    # the article deck and the real body. Keep both editorial regions while
+    # dropping the intervening search/navigation/breadcrumb/share toolbar.
+    navigation_start = clean.find("站内搜索")
+    if navigation_start >= 0:
+        share_match = re.search(r"分享到(?:微信|：)?", clean[navigation_start:])
+        if share_match:
+            body_start = navigation_start + share_match.end()
+            clean = (clean[:navigation_start].rstrip() + " " + clean[body_start:].lstrip()).strip()
     clean = re.sub(
         r"^(?:(?:中国日报网首页|中国日报中文网|China Daily|首页|时政|资讯|地方|国际|财经|文化|图片|视频|客户端|English)\s*){2,}",
         "",
@@ -131,7 +140,7 @@ def _clean_chinadaily_content(title: str, content: str) -> str:
     ends = [clean.find(marker) for marker in ARTICLE_END_MARKERS if clean.find(marker) >= 0]
     if ends:
         clean = clean[:min(ends)]
-    return clean.strip()
+    return re.sub(r"\s*[【\[]\s*$", "", clean).strip()
 
 
 def clean_article_content(url: str, title: str, content: str) -> str:
