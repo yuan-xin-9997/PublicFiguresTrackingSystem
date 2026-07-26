@@ -183,6 +183,26 @@ def test_target_person_must_be_the_action_subject():
         assert events == []
 
 
+def test_relayed_greetings_are_not_attributed_to_message_originator():
+    for evidence in [
+        "扎帕罗夫请王毅转达对习近平主席的亲切问候，表示吉方愿深化合作。",
+        "王毅转达习近平主席对扎帕罗夫的良好祝愿，表示双方应加强协作。",
+    ]:
+        result = extract(
+            {
+                "title": "吉尔吉斯斯坦总统扎帕罗夫会见王毅",
+                "content_text": evidence,
+                "published_at": "2026-07-22T10:00:00+08:00",
+                "language": "zh-CN",
+            },
+            [{"id": 1, "name": "习近平", "aliases": []}],
+            {"provider": "local", "review_threshold": 0.7},
+        )
+
+        assert result["events"] == []
+        assert result["attribution_stats"]["rejection_reasons"]["target_not_subject"] >= 1
+
+
 def test_background_guidance_and_name_only_do_not_create_other():
     persons = [{"id": 1, "name": "习近平", "aliases": []}]
     background = local_extract(
