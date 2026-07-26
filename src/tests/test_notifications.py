@@ -319,6 +319,11 @@ def test_notification_api_permissions_rules_and_audit(admin_client, configured_a
     assert "secret" not in config.text
 
     task_id, _, _ = _seed_delivery_data(configured_app.state.db, 0)
+    options = admin_client.get("/api/v1/notifications/options")
+    assert options.status_code == 200
+    assert options.json()["tasks"] == [{
+        "id": task_id, "name": "测试采集", "enabled": 1, "source_name": "测试来源",
+    }]
     created = admin_client.post("/api/v1/notifications/rules", json={
         "name": "API 规则", "task_ids": [task_id], "event_types": ["statement"], "enabled": True,
     })

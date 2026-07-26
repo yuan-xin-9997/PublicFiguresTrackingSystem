@@ -335,6 +335,14 @@ const App = {
       editingRuleId.value = null
     }
 
+    function selectAllRuleTasks() {
+      ruleForm.task_ids = data.notificationOptions.tasks.map(task => Number(task.id))
+    }
+
+    function clearRuleTasks() {
+      ruleForm.task_ids = []
+    }
+
     function editRule(rule) {
       editingRuleId.value = rule.id
       Object.assign(ruleForm, {
@@ -434,7 +442,7 @@ const App = {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
       maintenance, emailForm, ruleForm, editingRuleId, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
-      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, toggleRule, removeRule,
+      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, toggleRule, removeRule,
       openDelivery, retryDelivery, review, savePermissions, searchNow
     }
   },
@@ -604,7 +612,17 @@ const App = {
             <form class="form-grid notification-form" @submit.prevent="saveNotificationRule">
               <label>规则名称<input v-model="ruleForm.name" required /></label>
               <label class="check-line"><input v-model="ruleForm.enabled" type="checkbox" />启用规则</label>
-              <label>采集任务<select v-model="ruleForm.task_ids" multiple required><option v-for="task in data.notificationOptions.tasks" :key="task.id" :value="task.id">{{ task.name }} · {{ task.source_name }}</option></select></label>
+              <fieldset class="task-picker span-two">
+                <legend>采集任务（已选择 {{ ruleForm.task_ids.length }} 项）</legend>
+                <div class="task-picker-actions"><button type="button" @click="selectAllRuleTasks">全选</button><button type="button" @click="clearRuleTasks">清空</button></div>
+                <div class="task-option-grid">
+                  <label v-for="task in data.notificationOptions.tasks" :key="task.id" class="task-option">
+                    <input v-model="ruleForm.task_ids" type="checkbox" :value="task.id" />
+                    <span><strong>{{ task.name }}</strong><small>{{ task.source_name }} · {{ task.enabled ? '启用' : '停用' }}</small></span>
+                  </label>
+                </div>
+                <p v-if="!data.notificationOptions.tasks.length" class="form-hint">暂无可选采集任务，请先在信息源页面创建任务。</p>
+              </fieldset>
               <fieldset><legend>事件类型</legend><label v-for="type in data.notificationOptions.event_types" :key="type" class="check-line"><input v-model="ruleForm.event_types" type="checkbox" :value="type" />{{ eventLabels[type] }}</label></fieldset>
               <button class="primary">{{ editingRuleId ? '保存规则' : '创建规则' }}</button>
             </form>

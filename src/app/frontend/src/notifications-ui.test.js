@@ -20,6 +20,15 @@ describe('email notification management UI', () => {
     expect(source).toContain('formatBeijing(delivery.created_at)')
   })
 
+  it('uses explicit task checkboxes instead of a modifier-key multi-select', () => {
+    expect(source).toContain('class="task-picker span-two"')
+    expect(source).toContain('v-model="ruleForm.task_ids" type="checkbox"')
+    expect(source).toContain('@click="selectAllRuleTasks"')
+    expect(source).toContain('@click="clearRuleTasks"')
+    expect(source).not.toContain('v-model="ruleForm.task_ids" multiple')
+    expect(styles).toContain('.task-option-grid')
+  })
+
   it('provides responsive notification layout and status feedback', () => {
     expect(styles).toContain('.notification-form')
     expect(styles).toContain('.config-sources')
