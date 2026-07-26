@@ -1,0 +1,62 @@
+schema: spec-driven
+
+context: |
+  项目名称：公开人物行程追踪系统（PublicFiguresTrackingSystem）。
+
+  技术栈与架构：
+  - 优先使用 Python 开发；后端使用 FastAPI，前端使用 Vue。
+  - 数据库优先使用 SQLite，默认数据文件位于 src/data/app.sqlite3。
+  - 如需改用 SQLite 以外的数据库，必须先说明理由并获得审批。
+  - 涉及网页抓取时，优先调用集中网页抓取服务；服务地址、API Key、健康检查地址等必须通过配置读取，禁止硬编码。
+
+  必备基础模块：
+  - 登录功能：支持不同用户登录，用户密码信息维护在 src/data/password.txt。
+  - 权限管理：维护用户名、角色（admin/user）以及可访问页面；admin 默认拥有所有页面权限。
+  - 系统配置：展示配置文件中的当前系统配置。
+  - 任务中心：展示任务列表、任务日志、任务状态等。
+
+  目录结构约定：
+  - src/app：前后端代码目录。
+  - src/config/app.json：系统主配置文件，JSON 格式。
+  - src/data：数据目录，包含 app.sqlite3 与 password.txt；下载文件按 年/月/日 存放在 data 目录下。
+  - src/JenkinsConfig/Jenkinsfile：Jenkins 流水线文件。
+  - src/tests：测试脚本。
+  - src/logs：日志目录，包含 app.log、按日期切割的历史日志和 server.pid。
+  - src/README.md：项目自述文件。
+  - src/start.sh、src/stop.sh、src/status.sh：Linux 运维脚本。
+  - src/start.ps1、src/stop.ps1、src/status.ps1：Windows 运维脚本。
+
+  开发规范：
+  - 禁止在代码中硬编码 IP、端口、用户名、密码、绝对路径等环境相关信息；这些内容必须可配置。
+  - 系统展示时间如不是北京时间，必须在原始时间基础上额外展示北京时间。
+  - .gitignore 必须包含 logs 目录，但不能忽略 data 目录。
+  - 新增或变更功能后，根据影响范围同步更新需求规格说明书、设计说明书、README.md、Jenkinsfile 等文档或部署文件。
+
+  测试与交付：
+  - 所有功能必须包含基本单元测试、烟雾测试等，并在交付前通过。
+  - 首次部署需要创建 data 目录和 password.txt，默认内容如下：
+    # 格式: username:password:role  (role 取值: admin | user)
+    # admin 默认拥有所有页面权限；user 的可见页面由管理员在权限管理页配置。
+    # 修改本文件后，新用户在下次登录时会自动同步到数据库。
+    admin:admin123:admin
+  - 完成自测后，交付前需要整合 Jenkins，并参考“生成Jenkinsfile的提示词.md”执行部署。
+  - 提交到 Github 后，需要手动触发 Jenkins 手工构建，并提示用户访问构建后的服务验证功能。
+
+  文档要求：
+  - README.md 必须包含系统介绍、页面介绍、配置文件说明、部署方式、运维方式、访问方式等章节。
+  - 需求规格说明书和设计说明书需要随需求和实现及时更新。
+
+rules:
+  proposal:
+    - 明确说明变更目标、用户价值、影响范围和非目标。
+    - 涉及数据库、外部服务、部署、认证、权限或网页抓取时，必须写出配置项与安全约束。
+    - 如果方案偏离 FastAPI、Vue、SQLite 或既有目录结构，必须给出理由并标注需要审批。
+  spec:
+    - 使用可验证的 SHALL 需求描述，覆盖正常流程、异常流程、权限边界和配置行为。
+    - 对登录、权限管理、系统配置、任务中心等基础模块的影响必须单独说明。
+    - 涉及时间展示时，必须说明北京时间展示要求。
+  tasks:
+    - 任务应按后端、前端、配置、数据迁移、测试、文档、部署/Jenkins 分组。
+    - 每个用户可见功能必须包含对应测试任务。
+    - 完成项中必须包含 README.md、需求规格说明书、设计说明书的更新检查。
+    - 涉及部署的变更必须包含 Jenkinsfile 或 JenkinsConfig 检查，以及启动、停止、状态脚本验证。

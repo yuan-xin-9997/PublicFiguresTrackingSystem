@@ -28,3 +28,9 @@ export function queryString(values) {
   })
   return params.toString()
 }
+
+export function locationFilterLabel(locations) {
+  if (!locations?.length) return '全部地点'
+  if (locations.length === 1) return locations[0]
+  return `已选 ${locations.length} 个地点`
+}

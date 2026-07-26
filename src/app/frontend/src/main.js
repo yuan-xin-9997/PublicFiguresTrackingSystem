@@ -3,7 +3,7 @@
 import { computed, createApp, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue/dist/vue.esm-bundler.js'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { eventLabels, formatBeijing, percent, queryString, statusLabels } from './utils.js'
+import { eventLabels, formatBeijing, locationFilterLabel, percent, queryString, statusLabels } from './utils.js'
 import './styles.css'
 
 const API = '/api/v1'
@@ -271,7 +271,7 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, percent, visibleNav, manualSources,
+      searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
       runTask, review, savePermissions, searchNow
     }
@@ -315,7 +315,7 @@ const App = {
         </template>
 
         <template v-if="['timeline','review'].includes(active)">
-          <div class="toolbar">
+          <div :class="['toolbar', { 'timeline-toolbar': active === 'timeline' }]">
             <input v-model="filters.q" @keyup.enter="loadPage" placeholder="搜索标题、地点或言论" />
             <select v-model="filters.person_id"><option value="">全部人物</option><option v-for="p in data.persons" :value="p.id">{{ p.name }}</option></select>
             <select v-model="filters.event_type"><option value="">全部类型</option><option value="itinerary">行程</option><option value="statement">言论</option><option value="other">其他</option></select>
@@ -324,7 +324,23 @@ const App = {
             <input v-if="active==='timeline'" v-model="filters.start_date" type="date" title="开始日期" />
             <input v-if="active==='timeline'" v-model="filters.end_date" type="date" title="结束日期" />
             <select v-if="active==='timeline'" v-model="filters.sort_order"><option value="desc">时间降序（新到旧）</option><option value="asc">时间升序（旧到新）</option></select>
-            <select v-if="active==='timeline'" v-model="filters.location" multiple title="地点（可单选或多选）"><option v-for="place in data.locations" :value="place">{{ place }}</option></select>
+            <details v-if="active==='timeline'" class="location-filter">
+              <summary aria-label="选择地点（可多选）">
+                <span>{{ locationFilterLabel(filters.location) }}</span>
+                <span aria-hidden="true" class="location-filter-arrow">⌄</span>
+              </summary>
+              <div class="location-filter-panel" aria-label="地点选项">
+                <div class="location-filter-heading">
+                  <strong>选择地点</strong>
+                  <button v-if="filters.location.length" type="button" @click="filters.location=[]">清空</button>
+                </div>
+                <label v-for="place in data.locations" :key="place">
+                  <input v-model="filters.location" type="checkbox" :value="place" />
+                  <span>{{ place }}</span>
+                </label>
+                <p v-if="!data.locations.length" class="location-filter-empty">暂无可选地点</p>
+              </div>
+            </details>
             <button @click="loadPage">筛选</button>
           </div>
           <p class="result-count">共 {{ data.eventTotal }} 条事件</p>

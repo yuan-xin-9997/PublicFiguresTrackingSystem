@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { eventLabels, formatBeijing, percent, queryString } from './utils.js'
+import { eventLabels, formatBeijing, locationFilterLabel, percent, queryString } from './utils.js'
 
 describe('frontend utilities', () => {
   it('formats UTC as Beijing time', () => {
@@ -14,5 +14,10 @@ describe('frontend utilities', () => {
   })
   it('repeats array values for multi-select filters', () => {
     expect(queryString({ location: ['北京', '上海'] })).toBe('location=%E5%8C%97%E4%BA%AC&location=%E4%B8%8A%E6%B5%B7')
+  })
+  it('summarizes empty, single and multiple location selections', () => {
+    expect(locationFilterLabel([])).toBe('全部地点')
+    expect(locationFilterLabel(['北京'])).toBe('北京')
+    expect(locationFilterLabel(['北京', '上海'])).toBe('已选 2 个地点')
   })
 })
