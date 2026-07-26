@@ -14,6 +14,7 @@ pipeline {
             steps {
                 dir('src') {
                     sh '''
+                        python3 -m json.tool config/app.json >/dev/null
                         python3 -m venv .ci-venv
                         .ci-venv/bin/python -m pip install -r requirements.txt
                         PYTHONPATH=. .ci-venv/bin/python -m pytest -q
@@ -52,6 +53,13 @@ pipeline {
                     sleep 3
                     "$DEPLOY_DIR/status.sh"
                     curl -fsS http://127.0.0.1:28000/api/v1/health/ready
+                    SMOKE_USER=$(awk -F: '$3 == "admin" { print $1; exit }' "$DEPLOY_DIR/data/password.txt")
+                    SMOKE_PASSWORD=$(awk -F: '$3 == "admin" { print $2; exit }' "$DEPLOY_DIR/data/password.txt")
+                    test -n "$SMOKE_USER"
+                    test -n "$SMOKE_PASSWORD"
+                    PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
+                        "$DEPLOY_DIR/.venv/bin/python" "$DEPLOY_DIR/tests/smoke_live.py"
+                    unset SMOKE_USER SMOKE_PASSWORD
                 '''
             }
         }

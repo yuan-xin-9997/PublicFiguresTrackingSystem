@@ -36,7 +36,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ai": {
         "provider": "local",
         "base_url": "",
-        "model": "local-rules-v1",
+        "model": "local-rules-v2",
         "api_key_env": "PFTS_AI_API_KEY",
         "timeout_seconds": 30,
         "review_threshold": 0.7,

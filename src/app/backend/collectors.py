@@ -19,7 +19,7 @@ PUBLISHED_DATE_PATTERNS = (
 )
 ARTICLE_END_MARKERS = (
     "(责编：", "（责编：", "责任编辑：", "编辑：", "分享让更多人看到", "客户端下载",
-    "相关阅读", "相关新闻", "版权声明", "免责声明", "违法和不良信息举报",
+    "相关阅读", "相关新闻", "推荐阅读", "更多精彩内容", "版权声明", "免责声明", "违法和不良信息举报",
 )
 
 
@@ -30,6 +30,11 @@ NAVIGATION_MARKERS = (
 NAVIGATION_TITLE_MARKERS = (
     "首页", "专题首页", "最新播报", "评论解读", "智库报告", "权威速览",
     "要点海报", "学习快评", "更多>>", "更多 >",
+)
+CHINADAILY_HOST = "chinadaily.com.cn"
+CHINADAILY_NAVIGATION_MARKERS = (
+    "中国日报网首页", "中国日报中文网", "China Daily", "首页", "时政", "资讯",
+    "地方", "国际", "财经", "文化", "图片", "视频", "客户端", "English",
 )
 SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf", ".zip", ".rar",
@@ -102,6 +107,33 @@ def infer_published_at(url: str, text: str) -> Optional[str]:
     return None
 
 
+def is_chinadaily_url(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower().strip(".")
+    return host == CHINADAILY_HOST or host.endswith("." + CHINADAILY_HOST)
+
+
+def _clean_chinadaily_content(title: str, content: str) -> str:
+    clean = " ".join(content.split()).strip()
+    article_title = " ".join(title.split()).strip()
+    if article_title:
+        title_index = clean.find(article_title)
+        if title_index > 0:
+            clean = clean[title_index:]
+        duplicate = article_title + " " + article_title
+        while clean.startswith(duplicate):
+            clean = clean[len(article_title):].lstrip()
+    clean = re.sub(
+        r"^(?:(?:中国日报网首页|中国日报中文网|China Daily|首页|时政|资讯|地方|国际|财经|文化|图片|视频|客户端|English)\s*){2,}",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    ends = [clean.find(marker) for marker in ARTICLE_END_MARKERS if clean.find(marker) >= 0]
+    if ends:
+        clean = clean[:min(ends)]
+    return clean.strip()
+
+
 def clean_article_content(url: str, title: str, content: str) -> str:
     clean = " ".join((content or "").split())
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
@@ -125,6 +157,8 @@ def clean_article_content(url: str, title: str, content: str) -> str:
         # People.cn navigation is frequently composed of ordinary div elements,
         # so generic readability extraction cannot identify it as <nav>.
         clean = re.sub(r"^(?:打开\s+)?(?:登录|订阅|取消订阅|已收藏|收藏|大字号|小字号)\s+", "", clean)
+    if is_chinadaily_url(url):
+        clean = _clean_chinadaily_content(title, clean)
     return clean.strip()
 
 
@@ -335,6 +369,7 @@ def _article_rejection_reason(document: Dict[str, Any]) -> str:
     url = str(document.get("canonical_url") or "")
     title = " ".join(str(document.get("title") or "").split())
     content = " ".join(str(document.get("content_text") or "").split())
+    chinadaily = is_chinadaily_url(url)
     if _looks_like_navigation(url, title):
         return "URL 或标题指向栏目/首页"
     if not title or len(title) > 180:
@@ -344,6 +379,21 @@ def _article_rejection_reason(document: Dict[str, Any]) -> str:
         return "标题包含多个导航栏目"
     if len(content) < 12:
         return "正文过短"
+    if chinadaily:
+        path = urllib.parse.urlsplit(url).path.lower()
+        if path.rstrip("/") in {"", "/china", "/world", "/business", "/culture", "/video", "/photo"}:
+            return "中国日报 URL 指向首页或频道"
+        china_title_markers = sum(1 for marker in CHINADAILY_NAVIGATION_MARKERS if marker.lower() in title.lower())
+        china_content_markers = sum(
+            1 for marker in CHINADAILY_NAVIGATION_MARKERS
+            if marker.lower() in content[:800].lower()
+        )
+        if china_title_markers >= 3:
+            return "中国日报标题包含页面导航"
+        if china_content_markers >= 5:
+            return "中国日报正文仍含密集页面导航"
+        if title and content.count(title) >= 3:
+            return "中国日报正文重复页面标题"
     # A flattened portal page often repeats many navigation labels in both its
     # extracted title and body, even when the generic article adapter returns data.
     content_marker_count = sum(1 for marker in NAVIGATION_TITLE_MARKERS if marker in content[:1200])
@@ -362,6 +412,10 @@ def _article_document(url: str, source: Dict[str, Any], config: Dict[str, Any]) 
             if raw_content:
                 title = str(extracted.get("title") or source["name"])
                 content = clean_article_content(result["url"], title, raw_content)
+                metadata["content_quality"] = {
+                    "cleaned": content != " ".join(raw_content.split()).strip(),
+                    "pipeline": "generic.article",
+                }
                 return {
                     "canonical_url": canonicalize_url(result["url"]),
                     "title": title,
@@ -375,7 +429,12 @@ def _article_document(url: str, source: Dict[str, Any], config: Dict[str, Any]) 
     parser = TextExtractor()
     parser.feed(result["body"])
     title = " ".join(parser.title_parts) or source["name"]
-    content = clean_article_content(result["url"], title, "\n".join(parser.parts))
+    raw_content = "\n".join(parser.parts)
+    content = clean_article_content(result["url"], title, raw_content)
+    metadata["content_quality"] = {
+        "cleaned": content != " ".join(raw_content.split()).strip(),
+        "pipeline": "artifact-body-fallback",
+    }
     return {
         "canonical_url": canonicalize_url(result["url"]),
         "title": title,
@@ -399,8 +458,11 @@ def discover_website(source: Dict[str, Any], config: Dict[str, Any], max_items: 
     if not terms:
         raise ValueError("网站自动发现来源没有关联人物姓名或别名")
 
-    stats = {"pages_scanned": 0, "links_extracted": 0, "same_site_links": 0, "search_pages": 0,
-             "candidates": 0, "articles_fetched": 0, "accepted": 0, "errors": []}
+    stats = {
+        "pages_scanned": 0, "links_extracted": 0, "same_site_links": 0, "search_pages": 0,
+        "candidates": 0, "articles_fetched": 0, "accepted": 0, "cleaned_accepted": 0,
+        "rejected": 0, "rejection_reasons": {}, "errors": [],
+    }
     queue = [(root_url, 0)]
     queued = {root_url}
     scanned = set()
@@ -479,10 +541,14 @@ def discover_website(source: Dict[str, Any], config: Dict[str, Any], max_items: 
         document["fetch_metadata"]["discovery_terms"] = terms
         rejection_reason = _article_rejection_reason(document)
         if rejection_reason:
+            stats["rejected"] += 1
+            stats["rejection_reasons"][rejection_reason] = int(stats["rejection_reasons"].get(rejection_reason, 0)) + 1
             stats["errors"].append("拒绝非文章页 {}：{}".format(candidate, rejection_reason))
             continue
         if any(term in (document["title"] + " " + document["content_text"][:4000]).lower() for term in terms):
             documents.append(document)
+            if document.get("fetch_metadata", {}).get("content_quality", {}).get("cleaned"):
+                stats["cleaned_accepted"] += 1
     stats["accepted"] = len(documents)
     stats["errors"] = stats["errors"][:10]
     source["_discovery_stats"] = stats
@@ -536,4 +602,8 @@ def collect_source(source: Dict[str, Any], config: Dict[str, Any], max_items: in
         for document in documents:
             document["fetch_metadata"] = result.get("fetch_metadata", {})
         return documents
-    return [_article_document(source["entry_url"], source, config)]
+    document = _article_document(source["entry_url"], source, config)
+    rejection_reason = _article_rejection_reason(document)
+    if rejection_reason:
+        raise ValueError("拒绝非文章页：{}".format(rejection_reason))
+    return [document]

@@ -1,6 +1,6 @@
 import json
 
-from app.backend.extractor import event_dedup_key, external_extract, local_extract, normalize_location
+from app.backend.extractor import event_dedup_key, external_extract, extract, local_extract, normalize_location
 from app.backend.services import _event_similarity
 
 
@@ -167,3 +167,109 @@ def test_external_other_event_uses_document_publication_time(monkeypatch):
 
     assert events[0]["start_at"] == "2026-07-08T01:30:00+00:00"
     assert events[0]["time_precision"] == "day"
+
+
+def test_target_person_must_be_the_action_subject():
+    persons = [{"id": 1, "name": "习近平", "aliases": []}]
+    for title, content in (
+        ("吉尔吉斯斯坦总统扎帕罗夫会见王毅", "吉尔吉斯斯坦总统扎帕罗夫会见王毅。会见中转达了习近平的问候。"),
+        ("王毅会见伊朗外长阿拉格齐", "王毅会见伊朗外长阿拉格齐。双方提到习近平主席重视两国关系。"),
+        ("主席特使会见外宾", "习近平主席特使王毅会见来访外宾并交换意见。"),
+    ):
+        events = local_extract(
+            {"title": title, "content_text": content, "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN"},
+            persons, 0.7,
+        )
+        assert events == []
+
+
+def test_background_guidance_and_name_only_do_not_create_other():
+    persons = [{"id": 1, "name": "习近平", "aliases": []}]
+    background = local_extract(
+        {
+            "title": "专题学习会", "content_text": "会议学习贯彻习近平重要论述精神，部署下一阶段工作。",
+            "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+        },
+        persons, 0.7,
+    )
+    name_only = local_extract(
+        {
+            "title": "背景资料", "content_text": "这份资料多次提到习近平的公开履历。",
+            "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+        },
+        persons, 0.7,
+    )
+    assert background == []
+    assert name_only == []
+
+
+def test_pronoun_continuation_is_limited_to_unique_same_paragraph_owner():
+    persons = [
+        {"id": 1, "name": "习近平", "aliases": []},
+        {"id": 2, "name": "王毅", "aliases": []},
+    ]
+    clear = local_extract(
+        {
+            "title": "会见", "content_text": "习近平会见来宾。他表示，中方愿深化合作。",
+            "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+        },
+        persons, 0.7,
+    )
+    ambiguous = local_extract(
+        {
+            "title": "共同活动", "content_text": "习近平出席会议，王毅也出席会议。他表示，将推进后续工作。",
+            "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+        },
+        persons, 0.7,
+    )
+    cross_paragraph = local_extract(
+        {
+            "title": "会见", "content_text": "习近平会见来宾。\n他表示，中方愿深化合作。",
+            "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+        },
+        persons, 0.7,
+    )
+    assert any(event["person_id"] == 1 and event["event_type"] == "statement" for event in clear)
+    assert not any(event["summary"].startswith("他表示") for event in ambiguous)
+    assert not any(event["summary"].startswith("他表示") for event in cross_paragraph)
+
+
+def test_external_wrong_person_is_rejected_and_fallback_uses_same_rules(monkeypatch):
+    class WrongResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            payload = {"events": [{
+                "person_id": 1, "event_type": "itinerary", "title": "错误归属",
+                "summary": "习近平主席特使王毅会见来宾。", "start_at": None, "location_name": "",
+                "confirmation_status": "completed", "confidence": 0.9, "quote_text": "",
+                "evidence_text": "习近平主席特使王毅会见来宾。",
+            }]}
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}).encode()
+
+    document = {
+        "title": "王毅会见来宾", "content_text": "习近平主席特使王毅会见来宾。",
+        "published_at": "2026-07-20T00:00:00Z", "language": "zh-CN",
+    }
+    persons = [{"id": 1, "name": "习近平", "aliases": []}]
+    config = {
+        "provider": "external", "base_url": "https://ai.example", "api_key_env": "TEST_AI_KEY",
+        "model": "test", "review_threshold": 0.7,
+    }
+    monkeypatch.setenv("TEST_AI_KEY", "secret")
+    monkeypatch.setattr("app.backend.extractor.urllib.request.urlopen", lambda *_args, **_kwargs: WrongResponse())
+    external_result = extract(document, persons, config)
+    assert external_result["events"] == []
+    assert external_result["attribution_stats"]["rejected"] == 1
+
+    monkeypatch.setattr(
+        "app.backend.extractor.urllib.request.urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
+    )
+    fallback_result = extract(document, persons, config)
+    assert fallback_result["provider"] == "local-fallback"
+    assert fallback_result["events"] == []

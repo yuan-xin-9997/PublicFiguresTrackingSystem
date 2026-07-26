@@ -8,9 +8,15 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from .collectors import canonicalize_url, collect_source
+from .collectors import (
+    _article_rejection_reason,
+    canonicalize_url,
+    clean_article_content,
+    collect_source,
+    is_chinadaily_url,
+)
 from .database import Database, json_text
-from .extractor import event_core_text, extract
+from .extractor import event_core_text, extract, validate_document_evidence_subject
 from .security import utc_now
 
 
@@ -120,7 +126,12 @@ def insert_document(
     return document_id, True
 
 
-def analyze_document(db: Database, document_id: int, ai_config: Dict[str, Any]) -> int:
+def analyze_document(
+    db: Database,
+    document_id: int,
+    ai_config: Dict[str, Any],
+    stats_out: Optional[Dict[str, Any]] = None,
+) -> int:
     document = db.fetch_one(
         "SELECT d.*,s.trust_level FROM raw_documents d JOIN information_sources s ON s.id=d.source_id WHERE d.id=?",
         (document_id,),
@@ -129,14 +140,18 @@ def analyze_document(db: Database, document_id: int, ai_config: Dict[str, Any]) 
         raise ValueError("原始文档不存在")
     persons = get_persons_for_source(db, int(document["source_id"]))
     result = extract(document, persons, ai_config)
+    attribution_stats = result.get("attribution_stats") or {}
+    if stats_out is not None:
+        stats_out.update(attribution_stats)
     now = utc_now()
     with db.transaction() as connection:
         connection.execute(
             "INSERT INTO model_runs(document_id,provider,model,prompt_version,schema_version,status,latency_ms,usage_json,error_summary,created_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
-                document_id, result["provider"], result["model"], "pfts-extract-v1", "event-v1",
-                "fallback" if result["error"] else "success", result["latency_ms"], "{}", result["error"], now,
+                document_id, result["provider"], result["model"], "pfts-extract-v2", "event-v2",
+                "fallback" if result["error"] else "success", result["latency_ms"],
+                json_text({"attribution": attribution_stats}), result["error"], now,
             ),
         )
         event_count = 0
@@ -225,7 +240,11 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
         "INSERT INTO task_runs(task_id,status,started_at,correlation_id) VALUES(?,'running',?,?)",
         (task_id, started, correlation_id),
     )
-    counters = {"discovered": 0, "created": 0, "duplicate": 0, "events": 0, "failed": 0}
+    counters = {
+        "discovered": 0, "created": 0, "duplicate": 0, "events": 0, "failed": 0,
+        "attribution_candidates": 0, "attribution_accepted": 0, "attribution_rejected": 0,
+    }
+    attribution_reasons: Dict[str, int] = {}
     error_summary = ""
     status = "success"
     add_task_log(db, run_id, "INFO", "任务开始", {"source": task["source_name"], "correlation_id": correlation_id})
@@ -242,7 +261,13 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
                 document_id, created = insert_document(db, int(task["source_id"]), item, str(task["language"] or ""))
                 if created:
                     counters["created"] += 1
-                    counters["events"] += analyze_document(db, document_id, config["ai"])
+                    analysis_stats: Dict[str, Any] = {}
+                    counters["events"] += analyze_document(db, document_id, config["ai"], analysis_stats)
+                    counters["attribution_candidates"] += int(analysis_stats.get("candidates", 0))
+                    counters["attribution_accepted"] += int(analysis_stats.get("accepted", 0))
+                    counters["attribution_rejected"] += int(analysis_stats.get("rejected", 0))
+                    for reason, count in (analysis_stats.get("rejection_reasons") or {}).items():
+                        attribution_reasons[reason] = attribution_reasons.get(reason, 0) + int(count)
                 else:
                     counters["duplicate"] += 1
             except Exception as exc:
@@ -266,8 +291,242 @@ def run_collection_task(db: Database, task_id: int, config: Dict[str, Any]) -> D
         connection.execute("UPDATE collection_tasks SET last_run_at=?,next_run_at=?,updated_at=? WHERE id=?", (finished, next_run, finished, task_id))
         connection.execute("UPDATE information_sources SET last_checked_at=?,last_status=? WHERE id=?", (finished, status, task["source_id"]))
     add_task_log(db, run_id, "INFO", "任务结束", {"status": status, **counters})
+    add_task_log(
+        db, run_id, "INFO", "人物主体归属统计",
+        {
+            "candidates": counters["attribution_candidates"],
+            "accepted": counters["attribution_accepted"],
+            "rejected": counters["attribution_rejected"],
+            "rejection_reasons": attribution_reasons,
+        },
+    )
     return {"run_id": run_id, "status": status, **counters, "error_summary": error_summary,
             "discovery_stats": task.get("_discovery_stats")}
+
+
+def _person_with_aliases(db: Database, person_id: int) -> Optional[Dict[str, Any]]:
+    person = db.fetch_one("SELECT * FROM public_figures WHERE id=?", (person_id,))
+    if not person:
+        return None
+    person["aliases"] = [
+        row["alias"] for row in db.fetch_all(
+            "SELECT alias FROM person_aliases WHERE person_id=? AND enabled=1 ORDER BY id", (person_id,),
+        )
+    ]
+    return person
+
+
+def recheck_event_attribution(
+    db: Database,
+    dry_run: bool = True,
+    person_id: Optional[int] = None,
+    source_id: Optional[int] = None,
+    limit: int = 5000,
+) -> Dict[str, Any]:
+    where = []
+    params: List[Any] = []
+    if person_id is not None:
+        where.append("e.person_id=?")
+        params.append(person_id)
+    if source_id is not None:
+        where.append("d.source_id=?")
+        params.append(source_id)
+    clause = "WHERE " + " AND ".join(where) if where else ""
+    rows = db.fetch_all(
+        "SELECT ev.id AS evidence_id,ev.event_id,ev.evidence_text,e.person_id,e.event_type,e.human_locked,"
+        "d.id AS document_id,d.source_id,d.title,d.content_text,d.published_at,d.language,"
+        "p.name AS person_name,s.name AS source_name "
+        "FROM event_evidence ev JOIN timeline_events e ON e.id=ev.event_id "
+        "JOIN raw_documents d ON d.id=ev.document_id JOIN public_figures p ON p.id=e.person_id "
+        "JOIN information_sources s ON s.id=d.source_id " + clause + " ORDER BY ev.id LIMIT ?",
+        [*params, min(max(int(limit), 1), 10000)],
+    )
+    person_cache: Dict[int, Dict[str, Any]] = {}
+    source_person_cache: Dict[int, List[Dict[str, Any]]] = {}
+    invalid_rows: List[Dict[str, Any]] = []
+    locked_skipped = 0
+    accepted = 0
+    reasons: Dict[str, int] = {}
+    scanned_event_ids = set()
+    for row in rows:
+        scanned_event_ids.add(int(row["event_id"]))
+        if int(row["human_locked"]):
+            locked_skipped += 1
+            continue
+        target = person_cache.get(int(row["person_id"]))
+        if target is None:
+            target = _person_with_aliases(db, int(row["person_id"]))
+            if not target:
+                continue
+            person_cache[int(row["person_id"])] = target
+        persons = source_person_cache.get(int(row["source_id"]))
+        if persons is None:
+            persons = get_persons_for_source(db, int(row["source_id"]))
+            if not any(int(person["id"]) == int(target["id"]) for person in persons):
+                persons = [target, *persons]
+            source_person_cache[int(row["source_id"])] = persons
+        document = {
+            "title": row["title"], "content_text": row["content_text"],
+            "published_at": row["published_at"], "language": row["language"],
+        }
+        valid, reason = validate_document_evidence_subject(
+            document, str(row["evidence_text"]), target, persons, str(row["event_type"]),
+        )
+        if valid:
+            accepted += 1
+            continue
+        reasons[reason] = reasons.get(reason, 0) + 1
+        invalid_rows.append({
+            "evidence_id": int(row["evidence_id"]), "event_id": int(row["event_id"]),
+            "document_id": int(row["document_id"]), "person_name": row["person_name"],
+            "source_name": row["source_name"], "title": row["title"], "reason": reason,
+            "evidence_text": str(row["evidence_text"])[:300],
+        })
+    invalid_ids = [row["evidence_id"] for row in invalid_rows]
+    invalid_by_event: Dict[int, int] = {}
+    for row in invalid_rows:
+        invalid_by_event[row["event_id"]] = invalid_by_event.get(row["event_id"], 0) + 1
+    orphan_event_ids = []
+    kept_event_ids = []
+    for event_id, invalid_count in invalid_by_event.items():
+        total = int(db.fetch_one("SELECT COUNT(*) n FROM event_evidence WHERE event_id=?", (event_id,))["n"])
+        if total == invalid_count:
+            orphan_event_ids.append(event_id)
+        else:
+            kept_event_ids.append(event_id)
+    result = {
+        "dry_run": dry_run, "scanned_evidence": len(rows), "scanned_events": len(scanned_event_ids),
+        "accepted_evidence": accepted, "invalid_evidence": len(invalid_ids),
+        "kept_events": len(kept_event_ids), "orphan_events": len(orphan_event_ids),
+        "locked_skipped": locked_skipped, "rejection_reasons": reasons, "sample": invalid_rows[:20],
+    }
+    if dry_run or not invalid_ids:
+        return result
+    with db.transaction() as connection:
+        evidence_placeholders = ",".join("?" for _ in invalid_ids)
+        connection.execute(
+            "DELETE FROM event_evidence WHERE id IN ({})".format(evidence_placeholders), invalid_ids,
+        )
+        if orphan_event_ids:
+            event_placeholders = ",".join("?" for _ in orphan_event_ids)
+            connection.execute(
+                "DELETE FROM timeline_events WHERE id IN ({}) AND human_locked=0".format(event_placeholders),
+                orphan_event_ids,
+            )
+    result["deleted"] = True
+    return result
+
+
+def cleanup_chinadaily_documents(
+    db: Database,
+    ai_config: Dict[str, Any],
+    dry_run: bool = True,
+    source_id: Optional[int] = None,
+    limit: int = 2000,
+) -> Dict[str, Any]:
+    where = "WHERE d.source_id=?" if source_id is not None else ""
+    params: List[Any] = [source_id] if source_id is not None else []
+    documents = db.fetch_all(
+        "SELECT d.*,s.name AS source_name FROM raw_documents d "
+        "JOIN information_sources s ON s.id=d.source_id " + where + " ORDER BY d.id LIMIT ?",
+        [*params, min(max(int(limit), 1), 5000)],
+    )
+    rejected: List[Dict[str, Any]] = []
+    cleanable: List[Dict[str, Any]] = []
+    locked_skipped = 0
+    chinadaily_scanned = 0
+    for document in documents:
+        if not is_chinadaily_url(str(document["canonical_url"])):
+            continue
+        chinadaily_scanned += 1
+        locked = db.fetch_one(
+            "SELECT 1 found FROM event_evidence ev JOIN timeline_events e ON e.id=ev.event_id "
+            "WHERE ev.document_id=? AND e.human_locked=1 LIMIT 1", (document["id"],),
+        )
+        if locked:
+            locked_skipped += 1
+            continue
+        normalized_original = " ".join(str(document["content_text"]).split()).strip()
+        cleaned = clean_article_content(
+            str(document["canonical_url"]), str(document["title"]), str(document["content_text"]),
+        )
+        candidate = dict(document)
+        candidate["content_text"] = cleaned
+        reason = _article_rejection_reason(candidate)
+        item = {
+            "id": int(document["id"]), "title": document["title"],
+            "canonical_url": document["canonical_url"], "source_name": document["source_name"],
+            "reason": reason or "正文包含可清理的页面框架",
+        }
+        if reason:
+            rejected.append(item)
+        elif cleaned != normalized_original:
+            item["cleaned_content"] = cleaned
+            cleanable.append(item)
+    impacted_ids = [item["id"] for item in [*rejected, *cleanable]]
+    evidence_count = 0
+    orphan_event_ids: List[int] = []
+    if impacted_ids:
+        placeholders = ",".join("?" for _ in impacted_ids)
+        evidence_count = int(db.fetch_one(
+            "SELECT COUNT(*) n FROM event_evidence WHERE document_id IN ({})".format(placeholders),
+            impacted_ids,
+        )["n"])
+        orphan_event_ids = [
+            int(row["event_id"]) for row in db.fetch_all(
+                "SELECT DISTINCT ev.event_id FROM event_evidence ev JOIN timeline_events e ON e.id=ev.event_id "
+                "WHERE ev.document_id IN ({0}) AND e.human_locked=0 "
+                "AND NOT EXISTS (SELECT 1 FROM event_evidence keep WHERE keep.event_id=ev.event_id "
+                "AND keep.document_id NOT IN ({0}))".format(placeholders),
+                impacted_ids + impacted_ids,
+            )
+        ]
+    result = {
+        "dry_run": dry_run, "scanned_documents": chinadaily_scanned,
+        "rejected_documents": len(rejected), "cleanable_documents": len(cleanable),
+        "affected_evidence": evidence_count, "orphan_events": len(orphan_event_ids),
+        "locked_skipped": locked_skipped,
+        "sample": [
+            {key: value for key, value in item.items() if key != "cleaned_content"}
+            for item in [*rejected, *cleanable][:20]
+        ],
+    }
+    if dry_run or not impacted_ids:
+        return result
+    rejected_ids = [item["id"] for item in rejected]
+    cleanable_ids = [item["id"] for item in cleanable]
+    with db.transaction() as connection:
+        placeholders = ",".join("?" for _ in impacted_ids)
+        connection.execute("DELETE FROM model_runs WHERE document_id IN ({})".format(placeholders), impacted_ids)
+        connection.execute("DELETE FROM event_evidence WHERE document_id IN ({})".format(placeholders), impacted_ids)
+        if orphan_event_ids:
+            event_placeholders = ",".join("?" for _ in orphan_event_ids)
+            connection.execute(
+                "DELETE FROM timeline_events WHERE id IN ({}) AND human_locked=0".format(event_placeholders),
+                orphan_event_ids,
+            )
+        if rejected_ids:
+            rejected_placeholders = ",".join("?" for _ in rejected_ids)
+            connection.execute("DELETE FROM attachments WHERE document_id IN ({})".format(rejected_placeholders), rejected_ids)
+            connection.execute("DELETE FROM raw_documents WHERE id IN ({})".format(rejected_placeholders), rejected_ids)
+        for item in cleanable:
+            cleaned = str(item["cleaned_content"])
+            connection.execute(
+                "UPDATE raw_documents SET content_text=?,content_hash=?,status='collected',version=version+1 WHERE id=?",
+                (cleaned, hashlib.sha256(cleaned.encode("utf-8")).hexdigest(), item["id"]),
+            )
+    reanalysis_errors = []
+    reanalyzed_events = 0
+    for document_id in cleanable_ids:
+        try:
+            reanalyzed_events += analyze_document(db, document_id, ai_config)
+        except Exception as exc:
+            reanalysis_errors.append({"document_id": document_id, "error": str(exc)[:300]})
+    result.update({
+        "deleted": True, "reanalyzed_documents": len(cleanable_ids) - len(reanalysis_errors),
+        "reanalyzed_events": reanalyzed_events, "reanalysis_errors": reanalysis_errors[:10],
+    })
+    return result
 
 
 def event_detail(db: Database, event_id: int) -> Optional[Dict[str, Any]]:

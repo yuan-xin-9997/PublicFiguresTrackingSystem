@@ -23,7 +23,16 @@ from .security import (
     ALL_PAGES, create_session, current_user, parse_password_file, require_admin, require_page,
     revoke_session, sync_users, user_pages, utc_now, verify_password,
 )
-from .services import analyze_document, audit, event_detail, get_persons_for_source, insert_document, run_collection_task
+from .services import (
+    analyze_document,
+    audit,
+    cleanup_chinadaily_documents,
+    event_detail,
+    get_persons_for_source,
+    insert_document,
+    recheck_event_attribution,
+    run_collection_task,
+)
 
 
 LOGGER = logging.getLogger("pfts")
@@ -98,6 +107,19 @@ class PermissionBody(BaseModel):
 
 class CleanupNavigationBody(BaseModel):
     dry_run: bool = True
+
+
+class AttributionMaintenanceBody(BaseModel):
+    dry_run: bool = True
+    person_id: Optional[int] = None
+    source_id: Optional[int] = None
+    limit: int = Field(default=5000, ge=1, le=10000)
+
+
+class ChinaDailyMaintenanceBody(BaseModel):
+    dry_run: bool = True
+    source_id: Optional[int] = None
+    limit: int = Field(default=2000, ge=1, le=5000)
 
 
 def configure_logging(settings: Settings) -> None:
@@ -673,6 +695,67 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             (page_size, (page - 1) * page_size),
         )
         return _list_response(items, total, page, page_size)
+
+    @application.post("/api/v1/maintenance/recheck-event-attribution")
+    def maintenance_recheck_event_attribution(
+        body: AttributionMaintenanceBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        if body.person_id is not None and not db.fetch_one("SELECT id FROM public_figures WHERE id=?", (body.person_id,)):
+            raise HTTPException(404, "人物不存在")
+        if body.source_id is not None and not db.fetch_one("SELECT id FROM information_sources WHERE id=?", (body.source_id,)):
+            raise HTTPException(404, "来源不存在")
+        try:
+            result = recheck_event_attribution(
+                db, body.dry_run, body.person_id, body.source_id, body.limit,
+            )
+        except Exception as exc:
+            if not body.dry_run:
+                audit(
+                    db, "recheck_event_attribution", "maintenance", "", user["id"], result="failed",
+                    ip_address=_client_ip(request), summary=str(exc)[:500],
+                )
+            raise
+        if not body.dry_run:
+            audit(
+                db, "recheck_event_attribution", "maintenance", "", user["id"],
+                ip_address=_client_ip(request),
+                summary="删除无效证据 {}、孤立事件 {}，跳过锁定 {}".format(
+                    result["invalid_evidence"], result["orphan_events"], result["locked_skipped"],
+                ),
+            )
+        return result
+
+    @application.post("/api/v1/maintenance/cleanup-chinadaily-content")
+    def maintenance_cleanup_chinadaily_content(
+        body: ChinaDailyMaintenanceBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        if body.source_id is not None and not db.fetch_one("SELECT id FROM information_sources WHERE id=?", (body.source_id,)):
+            raise HTTPException(404, "来源不存在")
+        try:
+            result = cleanup_chinadaily_documents(
+                db, settings.get("ai"), body.dry_run, body.source_id, body.limit,
+            )
+        except Exception as exc:
+            if not body.dry_run:
+                audit(
+                    db, "cleanup_chinadaily_content", "maintenance", "", user["id"], result="failed",
+                    ip_address=_client_ip(request), summary=str(exc)[:500],
+                )
+            raise
+        if not body.dry_run:
+            audit(
+                db, "cleanup_chinadaily_content", "maintenance", "", user["id"],
+                ip_address=_client_ip(request),
+                summary="拒绝材料 {}、重清洗 {}、孤立事件 {}、跳过锁定 {}".format(
+                    result["rejected_documents"], result["cleanable_documents"],
+                    result["orphan_events"], result["locked_skipped"],
+                ),
+            )
+        return result
 
     @application.post("/api/v1/maintenance/cleanup-navigation-pages")
     def cleanup_navigation_pages(

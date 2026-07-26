@@ -1,3 +1,8 @@
+import pytest
+
+from app.backend.services import recheck_event_attribution
+
+
 def test_health_auth_and_permissions(client):
     assert client.get("/api/v1/health/live").status_code == 200
     assert client.get("/api/v1/health/ready").json()["status"] == "ready"
@@ -198,6 +203,159 @@ def test_admin_can_preview_and_cleanup_navigation_documents(admin_client, config
     assert db.fetch_one("SELECT id FROM raw_documents WHERE id=?", (document_id,)) is None
     assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (event_id,)) is None
     assert any(item["action"] == "cleanup_navigation_pages" for item in admin_client.get("/api/v1/audit-logs").json()["items"])
+
+
+def test_admin_rechecks_attribution_with_dry_run_lock_and_idempotency(admin_client, configured_app):
+    person = admin_client.post("/api/v1/persons", json={
+        "name": "习近平", "native_name": "", "bio": "", "organization": "", "title": "",
+        "country_region": "中国", "language": "zh-CN", "avatar_path": "", "enabled": True, "aliases": [],
+    }).json()
+    source = admin_client.post("/api/v1/sources", json={
+        "name": "归属测试材料", "type": "manual", "entry_url": "", "organization": "",
+        "language": "zh-CN", "trust_level": 4, "schedule_seconds": 3600,
+        "enabled": True, "person_ids": [person["id"]],
+    }).json()
+    db = configured_app.state.db
+
+    def add_document(title, content, content_hash):
+        return db.execute(
+            "INSERT INTO raw_documents(source_id,canonical_url,title,collected_at,content_text,content_hash,status) "
+            "VALUES(?,?,?,?,?,?,'analyzed')",
+            (source["id"], "https://example.com/" + content_hash, title, "2026-07-20", content, content_hash),
+        )
+
+    valid_document = add_document("习近平会见来宾", "习近平会见来宾。", "valid-attribution")
+    invalid_document = add_document("王毅会见来宾", "习近平主席特使王毅会见来宾。", "invalid-attribution")
+    shared_event = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (person["id"], "itinerary", "共享证据事件", "摘要", "shared-attribution", "2026-07-20", "2026-07-20"),
+    )
+    orphan_event = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (person["id"], "itinerary", "错误孤立事件", "摘要", "orphan-attribution", "2026-07-20", "2026-07-20"),
+    )
+    locked_event = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,1,?,?)",
+        (person["id"], "itinerary", "人工锁定事件", "摘要", "locked-attribution", "2026-07-20", "2026-07-20"),
+    )
+    db.execute_many(
+        "INSERT INTO event_evidence(event_id,document_id,evidence_text) VALUES(?,?,?)",
+        [
+            (shared_event, valid_document, "习近平会见来宾。"),
+            (shared_event, invalid_document, "习近平主席特使王毅会见来宾。"),
+            (orphan_event, invalid_document, "习近平主席特使王毅会见来宾。"),
+            (locked_event, invalid_document, "习近平主席特使王毅会见来宾。"),
+        ],
+    )
+
+    preview = admin_client.post("/api/v1/maintenance/recheck-event-attribution", json={
+        "dry_run": True, "person_id": person["id"], "source_id": source["id"],
+    })
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["invalid_evidence"] == 2
+    assert preview.json()["orphan_events"] == 1
+    assert preview.json()["kept_events"] == 1
+    assert preview.json()["locked_skipped"] == 1
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (orphan_event,))
+
+    db.execute(
+        "CREATE TRIGGER reject_attribution_cleanup BEFORE DELETE ON event_evidence "
+        "BEGIN SELECT RAISE(ABORT,'test rollback'); END"
+    )
+    with pytest.raises(Exception, match="test rollback"):
+        recheck_event_attribution(db, False, person["id"], source["id"])
+    assert int(db.fetch_one("SELECT COUNT(*) n FROM event_evidence WHERE event_id=?", (shared_event,))["n"]) == 2
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (orphan_event,))
+    db.execute("DROP TRIGGER reject_attribution_cleanup")
+
+    admin_client.post("/api/v1/auth/logout")
+    assert admin_client.post("/api/v1/auth/login", json={"username": "analyst", "password": "reader123"}).status_code == 200
+    denied = admin_client.post("/api/v1/maintenance/recheck-event-attribution", json={"dry_run": True})
+    assert denied.status_code == 403
+    admin_client.post("/api/v1/auth/logout")
+    assert admin_client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin123"}).status_code == 200
+
+    executed = admin_client.post("/api/v1/maintenance/recheck-event-attribution", json={
+        "dry_run": False, "person_id": person["id"], "source_id": source["id"],
+    })
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["deleted"] is True
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (shared_event,))
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (orphan_event,)) is None
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (locked_event,))
+    assert int(db.fetch_one("SELECT COUNT(*) n FROM event_evidence WHERE event_id=?", (shared_event,))["n"]) == 1
+
+    repeated = admin_client.post("/api/v1/maintenance/recheck-event-attribution", json={
+        "dry_run": False, "person_id": person["id"], "source_id": source["id"],
+    })
+    assert repeated.status_code == 200
+    assert repeated.json()["invalid_evidence"] == 0
+    assert any(
+        item["action"] == "recheck_event_attribution"
+        for item in admin_client.get("/api/v1/audit-logs").json()["items"]
+    )
+
+
+def test_admin_cleans_and_reanalyzes_chinadaily_content(admin_client, configured_app):
+    person = admin_client.post("/api/v1/persons", json={
+        "name": "习近平", "native_name": "", "bio": "", "organization": "", "title": "",
+        "country_region": "中国", "language": "zh-CN", "avatar_path": "", "enabled": True, "aliases": [],
+    }).json()
+    source = admin_client.post("/api/v1/sources", json={
+        "name": "中国日报网", "type": "manual", "entry_url": "", "organization": "",
+        "language": "zh-CN", "trust_level": 4, "schedule_seconds": 3600,
+        "enabled": True, "person_ids": [person["id"]],
+    }).json()
+    db = configured_app.state.db
+    title = "万山磅礴看主峰｜习近平谈亚太合作"
+    content = (
+        "中国日报网首页 China Daily 首页 时政 资讯 国际 财经 " + title + " " + title
+        + " 2026年7月20日，习近平表示，亚太各方应加强开放合作。这是文章第二段公开内容。"
+        + " 推荐阅读 王毅会见某国外长 编辑：测试"
+    )
+    document_id = db.execute(
+        "INSERT INTO raw_documents(source_id,canonical_url,title,collected_at,content_text,content_hash,status) "
+        "VALUES(?,?,?,?,?,?,'analyzed')",
+        (
+            source["id"], "https://cn.chinadaily.com.cn/a/202607/20/WS123456.html",
+            title, "2026-07-20", content, "chinadaily-polluted",
+        ),
+    )
+    event_id = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,dedup_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (person["id"], "other", "污染事件", "摘要", "chinadaily-old", "2026-07-20", "2026-07-20"),
+    )
+    db.execute(
+        "INSERT INTO event_evidence(event_id,document_id,evidence_text) VALUES(?,?,?)",
+        (event_id, document_id, "中国日报网首页 时政 资讯"),
+    )
+
+    preview = admin_client.post("/api/v1/maintenance/cleanup-chinadaily-content", json={
+        "dry_run": True, "source_id": source["id"],
+    })
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["cleanable_documents"] == 1
+    assert db.fetch_one("SELECT content_text FROM raw_documents WHERE id=?", (document_id,))["content_text"] == content
+
+    cleaned = admin_client.post("/api/v1/maintenance/cleanup-chinadaily-content", json={
+        "dry_run": False, "source_id": source["id"],
+    })
+    assert cleaned.status_code == 200, cleaned.text
+    stored = db.fetch_one("SELECT content_text,status FROM raw_documents WHERE id=?", (document_id,))
+    assert "中国日报网首页" not in stored["content_text"]
+    assert "推荐阅读" not in stored["content_text"]
+    assert stored["status"] == "analyzed"
+    assert db.fetch_one("SELECT id FROM timeline_events WHERE id=?", (event_id,)) is None
+    events = admin_client.get("/api/v1/events", params={"person_id": person["id"]}).json()["items"]
+    assert any(item["event_type"] == "statement" and item["title"] == title for item in events)
+    assert any(
+        item["action"] == "cleanup_chinadaily_content"
+        for item in admin_client.get("/api/v1/audit-logs").json()["items"]
+    )
 
 
 def test_person_can_be_edited_and_soft_deleted(admin_client):

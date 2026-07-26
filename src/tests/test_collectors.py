@@ -89,7 +89,7 @@ def test_webfetch_page_uses_central_fetch_and_extract(monkeypatch):
             })
         return FakeResponse({
             "request_id": "req_2", "adapter": "generic.article", "adapter_version": "1", "artifact_id": "art_1",
-            "data": {"title": "集中提取标题", "content": "集中服务提取的正文", "author": "记者", "date": "2026-07-04T08:00:00+08:00"},
+            "data": {"title": "集中提取标题", "content": "集中服务提取的正文，包含足够长度的公开事实内容。", "author": "记者", "date": "2026-07-04T08:00:00+08:00"},
         })
 
     monkeypatch.setenv("TEST_WEBFETCH_KEY", "secret-value")
@@ -101,7 +101,7 @@ def test_webfetch_page_uses_central_fetch_and_extract(monkeypatch):
     }
     documents = collect_source(source, config, 5)
     assert documents[0]["title"] == "集中提取标题"
-    assert documents[0]["content_text"] == "集中服务提取的正文"
+    assert documents[0]["content_text"] == "集中服务提取的正文，包含足够长度的公开事实内容。"
     assert documents[0]["canonical_url"] == "https://example.com/final"
     assert documents[0]["fetch_metadata"]["artifact_id"] == "art_1"
     assert calls[0]["body"]["mode"] == "auto"
@@ -252,3 +252,37 @@ def test_rejects_flattened_portal_page_returned_as_article():
     }
 
     assert _article_rejection_reason(document)
+
+
+def test_chinadaily_article_removes_homepage_prefix_and_recommendations():
+    title = "万山磅礴看主峰｜习近平谈亚太合作"
+    content = (
+        "中国日报网首页 China Daily 首页 时政 资讯 国际 财经 "
+        + title + " " + title
+        + " 2026年7月20日，习近平表示，亚太各方应加强开放合作。这是文章的第二段公开内容。"
+        + " 推荐阅读 王毅会见某国外长 编辑：测试 版权声明"
+    )
+    cleaned = clean_article_content(
+        "https://cn.chinadaily.com.cn/a/202607/20/WS123456.html", title, content,
+    )
+    assert cleaned.startswith(title)
+    assert cleaned.count(title) == 1
+    assert "中国日报网首页" not in cleaned
+    assert "推荐阅读" not in cleaned
+    assert "习近平表示" in cleaned
+
+
+def test_chinadaily_quality_rejects_channels_but_not_other_site_reprints():
+    channel = {
+        "canonical_url": "https://cn.chinadaily.com.cn/china/",
+        "title": "中国日报网首页 China Daily 首页 时政 资讯 国际",
+        "published_at": None,
+        "content_text": "中国日报网首页 China Daily 首页 时政 资讯 国际 财经 文化 图片 视频 " * 4,
+    }
+    assert _article_rejection_reason(channel)
+    reprint = clean_article_content(
+        "https://example.com/reprint.html",
+        "转载中国日报：公开合作消息",
+        "转载中国日报：公开合作消息 正文第一段内容完整。正文第二段继续介绍公开事实。",
+    )
+    assert reprint.startswith("转载中国日报")

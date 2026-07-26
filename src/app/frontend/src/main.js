@@ -44,6 +44,10 @@ const App = {
     const sourceForm = reactive({ name: '', type: 'website', entry_url: '', trust_level: 3, schedule_seconds: 3600, person_ids: [], discovery_enabled: true, discovery_max_pages: 12, discovery_max_depth: 1 })
     const editingSourceId = ref(null)
     const documentForm = reactive({ source_id: '', title: '', content_text: '', canonical_url: '', published_at: '' })
+    const maintenance = reactive({
+      attribution: { person_id: '', source_id: '', result: null },
+      chinadaily: { source_id: '', result: null }
+    })
     const searchTerm = ref('')
     const mapEl = ref(null)
     const mapPersonId = ref('')
@@ -116,6 +120,7 @@ const App = {
         else if (active.value === 'tasks') {
           data.tasks = (await api('/tasks')).items
           data.runs = (await api('/task-runs?page_size=30')).items
+          if (user.value.role === 'admin') await loadCommon()
         } else if (active.value === 'users') {
           const result = await api('/users'); data.users = result.items; data.allPages = result.all_pages
         } else if (active.value === 'config') data.config = (await api('/config/effective')).config
@@ -246,6 +251,23 @@ const App = {
       await perform(async () => { const result = await api(`/tasks/${id}/run`, { method: 'POST' }); flash(`运行完成：${result.status}`); await loadPage() }).catch(() => {})
     }
 
+    async function runMaintenance(kind, dryRun) {
+      const labels = { attribution: '事件归属重验', chinadaily: '中国日报正文清理' }
+      if (!dryRun && !window.confirm(`即将执行“${labels[kind]}”，会修改自动生成且未人工锁定的数据。确认已经完成 SQLite 备份并继续吗？`)) return
+      const state = maintenance[kind]
+      const path = kind === 'attribution' ? '/maintenance/recheck-event-attribution' : '/maintenance/cleanup-chinadaily-content'
+      const payload = {
+        dry_run: dryRun,
+        source_id: state.source_id ? Number(state.source_id) : null,
+        ...(kind === 'attribution' ? { person_id: state.person_id ? Number(state.person_id) : null } : {})
+      }
+      await perform(async () => {
+        state.result = await api(path, { method: 'POST', body: JSON.stringify(payload) })
+        flash(`${labels[kind]}${dryRun ? '预览' : '执行'}完成`)
+        if (!dryRun) await loadPage()
+      }).catch(() => {})
+    }
+
     async function review(id, action) {
       const reason = window.prompt(action === 'approve' ? '审核说明（可选）' : '请填写驳回原因', '')
       if (reason === null) return
@@ -271,9 +293,9 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      maintenance, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
-      runTask, review, savePermissions, searchNow
+      runTask, runMaintenance, review, savePermissions, searchNow
     }
   },
   template: `
@@ -365,6 +387,46 @@ const App = {
         </template>
 
         <template v-if="active === 'tasks'">
+          <section v-if="user.role==='admin'" class="panel maintenance-panel">
+            <div class="section-title"><h3>数据质量维护</h3><span>请先预览；执行前备份 SQLite，人工锁定事件不会修改</span></div>
+            <div class="maintenance-grid">
+              <article>
+                <h4>事件归属重验</h4>
+                <p>重新检查证据中的动作/言论主体，清除仅被提及人物的错误归属。</p>
+                <div class="maintenance-filters">
+                  <label>人物范围<select v-model="maintenance.attribution.person_id"><option value="">全部人物</option><option v-for="person in data.persons" :key="person.id" :value="person.id">{{ person.name }}</option></select></label>
+                  <label>来源范围<select v-model="maintenance.attribution.source_id"><option value="">全部来源</option><option v-for="source in data.sources" :key="source.id" :value="source.id">{{ source.name }}</option></select></label>
+                </div>
+                <div class="maintenance-actions"><button @click="runMaintenance('attribution',true)">预览影响</button><button class="danger" @click="runMaintenance('attribution',false)">确认执行</button></div>
+                <div v-if="maintenance.attribution.result" class="maintenance-result">
+                  <strong>{{ maintenance.attribution.result.dry_run ? '预览结果' : '执行结果' }}</strong>
+                  <span>扫描证据 {{ maintenance.attribution.result.scanned_evidence }}</span>
+                  <span>无效证据 {{ maintenance.attribution.result.invalid_evidence }}</span>
+                  <span>孤立事件 {{ maintenance.attribution.result.orphan_events }}</span>
+                  <span>保留事件 {{ maintenance.attribution.result.kept_events }}</span>
+                  <span>跳过锁定 {{ maintenance.attribution.result.locked_skipped }}</span>
+                  <ul v-if="maintenance.attribution.result.sample?.length"><li v-for="item in maintenance.attribution.result.sample" :key="item.evidence_id">{{ item.person_name }} · {{ item.title }} · {{ item.reason }}</li></ul>
+                </div>
+              </article>
+              <article>
+                <h4>中国日报正文清理</h4>
+                <p>识别首页、频道和页面框架污染，清洗合法文章并重做自动分析。</p>
+                <div class="maintenance-filters">
+                  <label>来源范围<select v-model="maintenance.chinadaily.source_id"><option value="">全部中国日报来源</option><option v-for="source in data.sources" :key="source.id" :value="source.id">{{ source.name }}</option></select></label>
+                </div>
+                <div class="maintenance-actions"><button @click="runMaintenance('chinadaily',true)">预览影响</button><button class="danger" @click="runMaintenance('chinadaily',false)">确认执行</button></div>
+                <div v-if="maintenance.chinadaily.result" class="maintenance-result">
+                  <strong>{{ maintenance.chinadaily.result.dry_run ? '预览结果' : '执行结果' }}</strong>
+                  <span>扫描材料 {{ maintenance.chinadaily.result.scanned_documents }}</span>
+                  <span>拒绝材料 {{ maintenance.chinadaily.result.rejected_documents }}</span>
+                  <span>可清洗材料 {{ maintenance.chinadaily.result.cleanable_documents }}</span>
+                  <span>孤立事件 {{ maintenance.chinadaily.result.orphan_events }}</span>
+                  <span>跳过锁定 {{ maintenance.chinadaily.result.locked_skipped }}</span>
+                  <ul v-if="maintenance.chinadaily.result.sample?.length"><li v-for="item in maintenance.chinadaily.result.sample" :key="item.id">{{ item.source_name }} · {{ item.title }} · {{ item.reason }}</li></ul>
+                </div>
+              </article>
+            </div>
+          </section>
           <section class="panel"><table><thead><tr><th>任务</th><th>来源</th><th>周期</th><th>上次运行</th><th>状态</th><th></th></tr></thead><tbody><tr v-for="task in data.tasks" :key="task.id"><td><strong>{{ task.name }}</strong></td><td>{{ task.source_name }}</td><td>{{ task.schedule_seconds }} 秒</td><td>{{ formatBeijing(task.last_run_at) }}</td><td>{{ task.last_status || '未运行' }}</td><td><button class="primary small" @click="runTask(task.id)">立即运行</button></td></tr></tbody></table></section>
           <section class="panel"><div class="section-title"><h3>最近运行</h3></div><table><thead><tr><th>任务</th><th>开始时间</th><th>状态</th><th>发现/新增/重复</th><th>事件</th><th>失败</th></tr></thead><tbody><tr v-for="run in data.runs" :key="run.id"><td>{{ run.task_name }}</td><td>{{ formatBeijing(run.started_at) }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.discovered_count }}/{{ run.created_count }}/{{ run.duplicate_count }}</td><td>{{ run.event_count }}</td><td>{{ run.failed_count }}</td></tr></tbody></table></section>
         </template>
