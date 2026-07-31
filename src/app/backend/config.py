@@ -64,6 +64,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "max_attempts": 5,
             "retry_base_seconds": 60,
             "timeout_seconds": 15,
+        },
+        "daily_digest": {
+            "timezone": "Asia/Shanghai",
+            "default_send_time": "08:30",
+            "default_window_mode": "previous_calendar_day",
+            "default_rolling_hours": 24,
+            "max_rolling_hours": 168,
+            "scheduler_poll_seconds": 30,
         }
     },
     "logging": {"level": "INFO", "retention_days": 30, "path": "logs/app.log"},

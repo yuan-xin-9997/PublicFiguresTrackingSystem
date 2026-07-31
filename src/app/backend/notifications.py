@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import Settings
+from .daily_digest import build_digest_message, refresh_digest_run_status
 from .database import Database, json_text
 from .security import utc_now
 
@@ -540,6 +541,11 @@ class NotificationWorker:
             "UPDATE email_delivery_batches SET status='retrying',next_attempt_at=?,updated_at=? WHERE status='sending'",
             (now, now),
         )
+        self.db.execute(
+            "UPDATE daily_digest_batches SET status='retrying',next_attempt_at=?,updated_at=? "
+            "WHERE status='sending'",
+            (now, now),
+        )
         self.thread.start()
 
     def stop(self) -> None:
@@ -568,15 +574,18 @@ class NotificationWorker:
                 (now,),
             ).fetchone()
             if not batch:
-                return None
-            batch = dict(batch)
-            changed = connection.execute(
-                "UPDATE email_delivery_batches SET status='sending',updated_at=? "
-                "WHERE id=? AND status IN ('pending','retrying')",
-                (now, batch["id"]),
-            )
-            if not changed.rowcount:
-                return None
+                batch = None
+            else:
+                batch = dict(batch)
+                changed = connection.execute(
+                    "UPDATE email_delivery_batches SET status='sending',updated_at=? "
+                    "WHERE id=? AND status IN ('pending','retrying')",
+                    (now, batch["id"]),
+                )
+                if not changed.rowcount:
+                    batch = None
+        if not batch:
+            return self.process_digest_once()
         try:
             config, _ = effective_email_config(self.settings, self.db, include_secret=True)
             message, deliverable, skipped = build_batch_message(self.db, self.settings, int(batch["id"]), config)
@@ -622,3 +631,93 @@ class NotificationWorker:
             )
             LOGGER.warning("email delivery batch %s failed: %s", batch["id"], safe_error)
             return {"id": batch["id"], "status": status, "error": safe_error}
+
+    def process_digest_once(self) -> Optional[Dict[str, Any]]:
+        now = utc_now()
+        with self.db.transaction() as connection:
+            batch = connection.execute(
+                "SELECT * FROM daily_digest_batches WHERE status IN ('pending','retrying') "
+                "AND next_attempt_at<=? ORDER BY id LIMIT 1",
+                (now,),
+            ).fetchone()
+            if not batch:
+                return None
+            batch = dict(batch)
+            changed = connection.execute(
+                "UPDATE daily_digest_batches SET status='sending',updated_at=? "
+                "WHERE id=? AND status IN ('pending','retrying')",
+                (now, batch["id"]),
+            )
+            if not changed.rowcount:
+                return None
+        try:
+            config, _ = effective_email_config(self.settings, self.db, include_secret=True)
+            message, deliverable, skipped = build_digest_message(
+                self.db, self.settings, int(batch["id"]), config
+            )
+            if skipped:
+                placeholders = ",".join("?" for _ in skipped)
+                self.db.execute(
+                    "UPDATE daily_digest_items SET status='skipped',"
+                    "skip_reason='事件已删除或被驳回' WHERE id IN ({})".format(placeholders),
+                    skipped,
+                )
+            if message is None:
+                self.db.execute(
+                    "UPDATE daily_digest_batches SET status='skipped',updated_at=?,"
+                    "last_error='' WHERE id=?",
+                    (utc_now(), batch["id"]),
+                )
+                refresh_digest_run_status(self.db, int(batch["run_id"]))
+                return {
+                    "id": batch["id"], "run_id": batch["run_id"],
+                    "kind": "daily_digest", "status": "skipped",
+                }
+            send_message(config, message)
+            finished = utc_now()
+            with self.db.transaction() as connection:
+                connection.execute(
+                    "UPDATE daily_digest_batches SET status='sent',"
+                    "attempt_count=attempt_count+1,sent_at=?,updated_at=?,last_error='' "
+                    "WHERE id=?",
+                    (finished, finished, batch["id"]),
+                )
+                if deliverable:
+                    placeholders = ",".join("?" for _ in deliverable)
+                    connection.execute(
+                        "UPDATE daily_digest_items SET status='sent' "
+                        "WHERE id IN ({})".format(placeholders),
+                        deliverable,
+                    )
+            refresh_digest_run_status(self.db, int(batch["run_id"]))
+            return {
+                "id": batch["id"], "run_id": batch["run_id"],
+                "kind": "daily_digest", "status": "sent",
+            }
+        except Exception as exc:
+            safe_error = sanitize_error(exc)
+            config, _ = effective_email_config(self.settings, self.db)
+            attempt = int(batch["attempt_count"]) + 1
+            maximum = int(config.get("max_attempts", 5))
+            status = "failed" if attempt >= maximum else "retrying"
+            delay = int(config.get("retry_base_seconds", 60)) * (
+                2 ** max(0, attempt - 1)
+            )
+            next_attempt = (
+                datetime.now(timezone.utc) + timedelta(seconds=delay)
+            ).replace(microsecond=0).isoformat()
+            self.db.execute(
+                "UPDATE daily_digest_batches SET status=?,attempt_count=?,"
+                "next_attempt_at=?,last_error=?,updated_at=? WHERE id=?",
+                (status, attempt, next_attempt, safe_error, utc_now(), batch["id"]),
+            )
+            self.db.execute(
+                "UPDATE daily_digest_runs SET error_summary=?,updated_at=? WHERE id=?",
+                (safe_error, utc_now(), batch["run_id"]),
+            )
+            refresh_digest_run_status(self.db, int(batch["run_id"]))
+            LOGGER.warning("daily digest batch %s failed: %s", batch["id"], safe_error)
+            return {
+                "id": batch["id"], "run_id": batch["run_id"],
+                "kind": "daily_digest", "status": status, "error": safe_error,
+            }

@@ -24,6 +24,15 @@ def main() -> int:
         notification_payload = email_config.json()["config"]
         assert "password" not in notification_payload
         assert isinstance(notification_payload.get("enabled"), bool)
+        digest_config = client.get("/api/v1/notifications/digests/config")
+        digest_config.raise_for_status()
+        digest_payload = digest_config.json()["config"]
+        assert digest_payload["default_send_time"] == "08:30"
+        assert digest_payload["default_window_mode"] == "previous_calendar_day"
+        digest_rules = client.get("/api/v1/notifications/digests/rules")
+        digest_rules.raise_for_status()
+        digest_runs = client.get("/api/v1/notifications/digests/runs?page_size=1")
+        digest_runs.raise_for_status()
         print("SMOKE_OK", ready.json()["status"], dashboard.json()["counts"])
     return 0
 

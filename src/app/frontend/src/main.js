@@ -34,7 +34,10 @@ const App = {
       dashboard: null, persons: [], sources: [], tasks: [], runs: [], events: [], eventTotal: 0,
       selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: [],
       notificationConfig: null, notificationRules: [], notificationOptions: { tasks: [], persons: [], event_types: [] },
-      deliveries: [], deliveryTotal: 0, selectedDelivery: null
+      deliveries: [], deliveryTotal: 0, selectedDelivery: null,
+      digestConfig: null, digestRules: [], digestRuns: [],
+      digestOptions: { persons: [], event_types: [], defaults: {} },
+      digestPreview: null, selectedDigestRun: null
     })
     const filters = reactive({
       q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '',
@@ -60,6 +63,15 @@ const App = {
     const ruleForm = reactive({ name: '', task_ids: [], person_ids: [], event_types: [], enabled: true })
     const editingRuleId = ref(null)
     const rulePersonSearch = ref('')
+    const digestForm = reactive({
+      name: '', person_ids: [], event_types: ['itinerary', 'statement'],
+      recipients: '', send_time: '08:30', window_mode: 'previous_calendar_day',
+      rolling_hours: 24, send_when_empty: false, enabled: true
+    })
+    const editingDigestRuleId = ref(null)
+    const digestPersonSearch = ref('')
+    const digestPreviewDate = ref('')
+    const digestRunFilters = reactive({ rule_id: '', run_status: '' })
     const deliveryFilters = reactive({ task_id: '', delivery_status: '' })
     const searchTerm = ref('')
     const mapEl = ref(null)
@@ -77,6 +89,15 @@ const App = {
       const query = rulePersonSearch.value.trim().toLowerCase()
       if (!query) return data.notificationOptions.persons
       return data.notificationOptions.persons.filter(person =>
+        [person.name, person.organization, person.title].some(value =>
+          String(value || '').toLowerCase().includes(query)
+        )
+      )
+    })
+    const visibleDigestPersons = computed(() => {
+      const query = digestPersonSearch.value.trim().toLowerCase()
+      if (!query) return data.digestOptions.persons
+      return data.digestOptions.persons.filter(person =>
         [person.name, person.organization, person.title].some(value =>
           String(value || '').toLowerCase().includes(query)
         )
@@ -144,17 +165,33 @@ const App = {
         else if (active.value === 'tasks') {
           data.tasks = (await api('/tasks')).items
           data.runs = (await api('/task-runs?page_size=30')).items
+          if (user.value.pages.includes('notifications')) {
+            data.digestRuns = (await api('/notifications/digests/runs?page_size=10')).items
+          }
           if (user.value.role === 'admin') await loadCommon()
         } else if (active.value === 'notifications') {
-          const [configResult, rulesResult, optionsResult, deliveriesResult] = await Promise.all([
+          const [configResult, rulesResult, optionsResult, deliveriesResult, digestConfigResult, digestRulesResult, digestOptionsResult, digestRunsResult] = await Promise.all([
             api('/notifications/email/config'), api('/notifications/rules'), api('/notifications/options'),
-            api(`/notifications/deliveries?${queryString({ page_size: 50, ...deliveryFilters })}`)
+            api(`/notifications/deliveries?${queryString({ page_size: 50, ...deliveryFilters })}`),
+            api('/notifications/digests/config'), api('/notifications/digests/rules'),
+            api('/notifications/digests/options'),
+            api(`/notifications/digests/runs?${queryString({ page_size: 50, ...digestRunFilters })}`)
           ])
           data.notificationConfig = configResult
           data.notificationRules = rulesResult.items
           data.notificationOptions = optionsResult
           data.deliveries = deliveriesResult.items
           data.deliveryTotal = deliveriesResult.total
+          data.digestConfig = digestConfigResult
+          data.digestRules = digestRulesResult.items
+          data.digestOptions = digestOptionsResult
+          data.digestRuns = digestRunsResult.items
+          if (!editingDigestRuleId.value) {
+            const defaults = digestOptionsResult.defaults || {}
+            digestForm.send_time = defaults.default_send_time || '08:30'
+            digestForm.window_mode = defaults.default_window_mode || 'previous_calendar_day'
+            digestForm.rolling_hours = defaults.default_rolling_hours || 24
+          }
           const config = configResult.config
           Object.assign(emailForm, {
             enabled: Boolean(config.enabled), smtp_host: config.smtp_host || '', smtp_port: config.smtp_port || 587,
@@ -409,6 +446,139 @@ const App = {
       }).catch(() => {})
     }
 
+    function resetDigestForm() {
+      const defaults = data.digestOptions.defaults || {}
+      Object.assign(digestForm, {
+        name: '', person_ids: [], event_types: ['itinerary', 'statement'],
+        recipients: '', send_time: defaults.default_send_time || '08:30',
+        window_mode: defaults.default_window_mode || 'previous_calendar_day',
+        rolling_hours: defaults.default_rolling_hours || 24,
+        send_when_empty: false, enabled: true
+      })
+      editingDigestRuleId.value = null
+      digestPersonSearch.value = ''
+      data.digestPreview = null
+    }
+
+    function selectAllDigestPersons() {
+      digestForm.person_ids = data.digestOptions.persons.map(person => Number(person.id))
+    }
+
+    function clearDigestPersons() {
+      digestForm.person_ids = []
+    }
+
+    function digestPayload(enabled = digestForm.enabled) {
+      return {
+        ...digestForm,
+        enabled,
+        person_ids: digestForm.person_ids.map(Number),
+        event_types: [...digestForm.event_types],
+        recipients: String(digestForm.recipients || '').split(/[,;，；\n]/).map(value => value.trim()).filter(Boolean),
+        rolling_hours: Number(digestForm.rolling_hours)
+      }
+    }
+
+    function editDigestRule(rule) {
+      editingDigestRuleId.value = rule.id
+      Object.assign(digestForm, {
+        name: rule.name,
+        person_ids: [...(rule.person_ids || [])],
+        event_types: [...(rule.event_types || [])],
+        recipients: (rule.recipients || []).join(', '),
+        send_time: rule.send_time,
+        window_mode: rule.window_mode,
+        rolling_hours: rule.rolling_hours,
+        send_when_empty: Boolean(rule.send_when_empty),
+        enabled: Boolean(rule.enabled)
+      })
+      data.digestPreview = null
+    }
+
+    async function saveDigestRule() {
+      if (!digestForm.person_ids.length) {
+        error.value = '每日时间线邮件至少选择一个人物'
+        return
+      }
+      await perform(async () => {
+        const editing = editingDigestRuleId.value
+        await api(editing ? `/notifications/digests/rules/${editing}` : '/notifications/digests/rules', {
+          method: editing ? 'PUT' : 'POST',
+          body: JSON.stringify(digestPayload())
+        })
+        resetDigestForm()
+        flash(editing ? '日报规则已更新' : '日报规则已创建')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function previewDigestRule(rule = null) {
+      const targetId = rule?.id || editingDigestRuleId.value
+      if (!targetId) {
+        error.value = '请先保存日报规则，再预览时间窗口'
+        return
+      }
+      await perform(async () => {
+        data.digestPreview = await api(`/notifications/digests/rules/${targetId}/preview`, {
+          method: 'POST',
+          body: JSON.stringify({ scheduled_date: digestPreviewDate.value || null })
+        })
+      }).catch(() => {})
+    }
+
+    async function toggleDigestRule(rule) {
+      await perform(async () => {
+        await api(`/notifications/digests/rules/${rule.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: rule.name, person_ids: rule.person_ids,
+            event_types: rule.event_types, recipients: rule.recipients,
+            send_time: rule.send_time, window_mode: rule.window_mode,
+            rolling_hours: rule.rolling_hours,
+            send_when_empty: Boolean(rule.send_when_empty), enabled: !rule.enabled
+          })
+        })
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function removeDigestRule(rule) {
+      if (!window.confirm(`确定删除日报规则“${rule.name}”吗？历史运行和投递记录会保留。`)) return
+      await perform(async () => {
+        await api(`/notifications/digests/rules/${rule.id}`, { method: 'DELETE' })
+        if (editingDigestRuleId.value === rule.id) resetDigestForm()
+        flash('日报规则已删除')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function runDigestRule(rule) {
+      const scheduledDate = window.prompt('输入需要补跑的业务日期（YYYY-MM-DD）', digestPreviewDate.value || '')
+      if (!scheduledDate) return
+      await perform(async () => {
+        await api(`/notifications/digests/rules/${rule.id}/runs`, {
+          method: 'POST', body: JSON.stringify({ scheduled_date: scheduledDate })
+        })
+        flash('日报补跑已创建')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function openDigestRun(id) {
+      await perform(async () => {
+        data.selectedDigestRun = await api(`/notifications/digests/runs/${id}`)
+      }).catch(() => {})
+    }
+
+    async function retryDigestBatch(id) {
+      await perform(async () => {
+        await api(`/notifications/digests/batches/${id}/retry`, { method: 'POST' })
+        data.selectedDigestRun = null
+        flash('失败日报批次已进入重试队列')
+        await loadPage()
+      }).catch(() => {})
+    }
+
     async function openDelivery(id) {
       await perform(async () => { data.selectedDelivery = await api(`/notifications/deliveries/${id}`) }).catch(() => {})
     }
@@ -465,8 +635,10 @@ const App = {
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
       maintenance, emailForm, ruleForm, editingRuleId, rulePersonSearch, visibleRulePersons, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestPreviewDate, digestRunFilters,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
       runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, selectAllRulePersons, clearRulePersons, toggleRule, removeRule,
+      saveDigestRule, editDigestRule, resetDigestForm, selectAllDigestPersons, clearDigestPersons, previewDigestRule, toggleDigestRule, removeDigestRule, runDigestRule, openDigestRun, retryDigestBatch,
       openDelivery, retryDelivery, review, savePermissions, searchNow
     }
   },
@@ -601,6 +773,7 @@ const App = {
           </section>
           <section class="panel"><table><thead><tr><th>任务</th><th>来源</th><th>周期</th><th>上次运行</th><th>状态</th><th></th></tr></thead><tbody><tr v-for="task in data.tasks" :key="task.id"><td><strong>{{ task.name }}</strong></td><td>{{ task.source_name }}</td><td>{{ task.schedule_seconds }} 秒</td><td>{{ formatBeijing(task.last_run_at) }}</td><td>{{ task.last_status || '未运行' }}</td><td><button class="primary small" @click="runTask(task.id)">立即运行</button></td></tr></tbody></table></section>
           <section class="panel"><div class="section-title"><h3>最近运行</h3></div><table><thead><tr><th>任务</th><th>开始时间</th><th>状态</th><th>发现/新增/重复</th><th>事件</th><th>邮件</th><th>失败</th></tr></thead><tbody><tr v-for="run in data.runs" :key="run.id"><td>{{ run.task_name }}</td><td>{{ formatBeijing(run.started_at) }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.discovered_count }}/{{ run.created_count }}/{{ run.duplicate_count }}</td><td>{{ run.event_count }}</td><td><button v-if="run.notification_batches && user.pages.includes('notifications')" @click="selectPage('notifications')">{{ run.notification_items }} 项 / {{ run.notification_batches }} 批</button><span v-else>{{ run.notification_items || 0 }}</span><small v-if="run.notification_error" class="delivery-error">{{ run.notification_error }}</small></td><td>{{ run.failed_count }}</td></tr></tbody></table></section>
+          <section v-if="user.pages.includes('notifications')" class="panel"><div class="section-title"><h3>最近日报运行</h3><button @click="selectPage('notifications')">查看推送管理</button></div><table><thead><tr><th>业务日期</th><th>规则</th><th>窗口</th><th>候选</th><th>状态</th></tr></thead><tbody><tr v-for="run in data.digestRuns" :key="'digest-'+run.id"><td>{{ run.scheduled_date }}</td><td>{{ run.rule_name }}</td><td>{{ formatBeijing(run.window_start) }} — {{ formatBeijing(run.window_end) }}</td><td>{{ run.candidate_count }}</td><td><span class="status">{{ run.status }}</span></td></tr></tbody></table><p v-if="!data.digestRuns.length" class="empty">暂无日报运行记录。</p></section>
         </template>
 
         <template v-if="active === 'notifications'">
@@ -629,6 +802,69 @@ const App = {
               <div class="notification-actions span-two"><button class="primary">保存邮件配置</button><button type="button" @click="testEmail">发送测试邮件</button><button type="button" class="delete-link" @click="resetEmailOverrides">恢复文件配置</button></div>
             </form>
             <dl class="config-sources"><div v-for="(source,field) in data.notificationConfig.sources" :key="field"><dt>{{ field }}</dt><dd>{{ source }}</dd></div></dl>
+          </section>
+
+          <section v-if="user.role==='admin'" class="panel form-panel digest-form-panel">
+            <div class="section-title"><h3>{{ editingDigestRuleId ? '编辑每日时间线邮件' : '新增每日时间线邮件' }}</h3><button v-if="editingDigestRuleId" @click="resetDigestForm">取消编辑</button></div>
+            <p class="form-hint">人物、发送时间和汇总周期均可配置；默认每天北京时间 08:30 汇总昨天自然日，按事件发生时间升序发送。</p>
+            <form class="form-grid notification-form digest-form" @submit.prevent="saveDigestRule">
+              <label>规则名称<input v-model="digestForm.name" required placeholder="例如：重点人物早报" /></label>
+              <label>发送时间（北京时间）<input v-model="digestForm.send_time" type="time" required aria-label="日报发送时间" /></label>
+              <label>汇总周期<select v-model="digestForm.window_mode"><option value="previous_calendar_day">昨天自然日</option><option value="rolling_hours">发送前最近 N 小时</option></select></label>
+              <label v-if="digestForm.window_mode==='rolling_hours'">最近小时数<input v-model.number="digestForm.rolling_hours" type="number" min="1" :max="data.digestOptions.defaults?.max_rolling_hours || 168" /></label>
+              <label class="span-two">收件邮箱（逗号分隔）<input v-model="digestForm.recipients" type="text" required placeholder="me@example.com" /></label>
+              <label class="check-line"><input v-model="digestForm.enabled" type="checkbox" />启用日报规则</label>
+              <label class="check-line"><input v-model="digestForm.send_when_empty" type="checkbox" />无动态时也发送邮件</label>
+              <fieldset class="task-picker person-picker span-two">
+                <legend>跟踪人物（已选择 {{ digestForm.person_ids.length }} 人，必选）</legend>
+                <div class="task-picker-actions"><button type="button" @click="selectAllDigestPersons">全选</button><button type="button" @click="clearDigestPersons">清空</button></div>
+                <input v-model="digestPersonSearch" class="person-search" type="search" placeholder="搜索人物、机构或职务" aria-label="搜索日报人物" />
+                <div class="task-option-grid person-option-grid">
+                  <label v-for="person in visibleDigestPersons" :key="person.id" class="task-option">
+                    <input v-model="digestForm.person_ids" type="checkbox" :value="person.id" />
+                    <span><strong>{{ person.name }}</strong><small>{{ [person.organization, person.title].filter(Boolean).join(' · ') || '暂无机构或职务' }}</small></span>
+                  </label>
+                </div>
+                <p v-if="!digestForm.person_ids.length" class="form-hint digest-required-hint">请至少选择一个人物。</p>
+              </fieldset>
+              <fieldset><legend>事件类型</legend><label v-for="type in data.digestOptions.event_types" :key="type" class="check-line"><input v-model="digestForm.event_types" type="checkbox" :value="type" />{{ eventLabels[type] }}</label></fieldset>
+              <div class="notification-actions"><button class="primary">{{ editingDigestRuleId ? '保存日报规则' : '创建日报规则' }}</button><button v-if="editingDigestRuleId" type="button" @click="previewDigestRule()">预览窗口</button></div>
+            </form>
+            <div v-if="editingDigestRuleId" class="digest-preview-controls">
+              <label>指定业务日期（留空预览下一次）<input v-model="digestPreviewDate" type="date" /></label>
+              <button @click="previewDigestRule()">刷新预览</button>
+            </div>
+            <article v-if="data.digestPreview" class="digest-preview" aria-live="polite">
+              <strong>窗口预览 · {{ data.digestPreview.candidate_count }} 条事件</strong>
+              <span>{{ formatBeijing(data.digestPreview.window_start) }}（含）— {{ formatBeijing(data.digestPreview.window_end) }}（不含）</span>
+              <ul><li v-for="item in data.digestPreview.sample" :key="item.id">{{ formatBeijing(item.start_at) }} · {{ item.person_name }} · {{ eventLabels[item.event_type] }} · {{ item.title }}</li></ul>
+            </article>
+          </section>
+
+          <section class="panel digest-rules-panel">
+            <div class="section-title"><h3>每日时间线邮件</h3><span>{{ data.digestRules.length }} 条</span></div>
+            <table><thead><tr><th>规则</th><th>人物</th><th>类型</th><th>发送时间</th><th>汇总周期</th><th>下次运行</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
+              <tr v-for="rule in data.digestRules" :key="rule.id">
+                <td><strong>{{ rule.name }}</strong><small>{{ (rule.recipients || []).join('、') }}</small></td>
+                <td>{{ rule.person_ids.map(id => data.digestOptions.persons.find(person => person.id===id)?.name || '#'+id).join('、') }}</td>
+                <td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td>
+                <td>{{ rule.send_time }} 北京时间</td>
+                <td>{{ rule.window_mode==='previous_calendar_day' ? '昨天自然日' : '最近 '+rule.rolling_hours+' 小时' }}</td>
+                <td>{{ formatBeijing(rule.next_run_at) }}</td>
+                <td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td>
+                <td v-if="user.role==='admin'"><div class="table-actions"><button @click="editDigestRule(rule)">编辑</button><button @click="previewDigestRule(rule)">预览</button><button @click="runDigestRule(rule)">补跑</button><button @click="toggleDigestRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeDigestRule(rule)">删除</button></div></td>
+              </tr>
+            </tbody></table>
+            <p v-if="!data.digestRules.length" class="empty">尚未创建每日时间线邮件规则。</p>
+          </section>
+
+          <section class="panel digest-runs-panel">
+            <div class="section-title"><h3>日报运行记录</h3><span>自动运行、空日报与补跑均在此保留</span></div>
+            <div class="toolbar notification-toolbar"><select v-model="digestRunFilters.rule_id"><option value="">全部日报规则</option><option v-for="rule in data.digestRules" :value="rule.id">{{ rule.name }}</option></select><select v-model="digestRunFilters.run_status"><option value="">全部状态</option><option v-for="status in ['pending','empty','sending','sent','partial','failed','skipped']" :value="status">{{ status }}</option></select><button @click="loadPage">筛选</button></div>
+            <table><thead><tr><th>业务日期</th><th>规则</th><th>汇总窗口</th><th>候选/批次</th><th>状态</th><th>触发</th><th>错过</th></tr></thead><tbody>
+              <tr v-for="run in data.digestRuns" :key="run.id" class="clickable-row" @click="openDigestRun(run.id)"><td>{{ run.scheduled_date }}</td><td>{{ run.rule_name }}</td><td>{{ formatBeijing(run.window_start) }}<small>至 {{ formatBeijing(run.window_end) }}</small></td><td>{{ run.candidate_count }} / {{ run.batch_count }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.trigger_type==='manual' ? '手工补跑' : '自动' }}</td><td>{{ run.missed_count || 0 }}</td></tr>
+            </tbody></table>
+            <p v-if="!data.digestRuns.length" class="empty">暂无日报运行记录。</p>
           </section>
 
           <section v-if="user.role==='admin'" class="panel form-panel">
@@ -697,6 +933,7 @@ const App = {
         <template v-if="active === 'audit'"><section class="panel"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>结果</th><th>摘要</th></tr></thead><tbody><tr v-for="item in data.audit" :key="item.id"><td>{{ formatBeijing(item.created_at) }}</td><td>{{ item.username || '系统/未知' }}</td><td>{{ item.action }}</td><td>{{ item.object_type }} #{{ item.object_id }}</td><td>{{ item.result }}</td><td>{{ item.change_summary }}</td></tr></tbody></table></section></template>
 
           <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="primary" @click="review(data.selectedEvent.id,'approve')">通过审核</button><button class="danger" @click="review(data.selectedEvent.id,'reject')">驳回</button></div></section></aside>
+          <aside v-if="data.selectedDigestRun" class="detail-overlay" @click.self="data.selectedDigestRun=null"><section class="detail-panel"><button class="close" @click="data.selectedDigestRun=null">×</button><p class="eyebrow">DAILY TIMELINE DIGEST</p><h2>{{ data.selectedDigestRun.rule_name }} · {{ data.selectedDigestRun.scheduled_date }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDigestRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedDigestRun.trigger_type==='manual' ? '手工补跑' : '自动调度' }}</strong></div><div><small>窗口开始</small><strong>{{ formatBeijing(data.selectedDigestRun.window_start) }}</strong></div><div><small>窗口结束</small><strong>{{ formatBeijing(data.selectedDigestRun.window_end) }}</strong></div></div><p v-if="data.selectedDigestRun.error_summary" class="error">{{ data.selectedDigestRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedDigestRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryDigestBatch(batch.id)">重新投递</button></article><h3>时间线明细</h3><article class="evidence" v-for="item in data.selectedDigestRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
           <aside v-if="data.selectedDelivery" class="detail-overlay" @click.self="data.selectedDelivery=null"><section class="detail-panel"><button class="close" @click="data.selectedDelivery=null">×</button><p class="eyebrow">EMAIL DELIVERY</p><h2>{{ data.selectedDelivery.task_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDelivery.status }}</strong></div><div><small>收件人</small><strong>{{ data.selectedDelivery.recipient }}</strong></div><div><small>创建时间</small><strong>{{ formatBeijing(data.selectedDelivery.created_at) }}</strong></div><div><small>发送时间</small><strong>{{ formatBeijing(data.selectedDelivery.sent_at) }}</strong></div></div><p v-if="data.selectedDelivery.last_error" class="error">{{ data.selectedDelivery.last_error }}</p><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedDelivery.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article><button v-if="user.role==='admin' && data.selectedDelivery.status==='failed'" class="primary" @click="retryDelivery(data.selectedDelivery.id)">重新投递</button></section></aside>
       </section>
     </div>

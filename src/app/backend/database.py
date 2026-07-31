@@ -290,6 +290,95 @@ CREATE TABLE IF NOT EXISTS email_delivery_items (
     UNIQUE(task_run_id, event_id, recipient)
 );
 CREATE INDEX IF NOT EXISTS idx_email_items_batch ON email_delivery_items(batch_id, id);
+CREATE TABLE IF NOT EXISTS daily_digest_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    send_time TEXT NOT NULL,
+    window_mode TEXT NOT NULL
+        CHECK(window_mode IN ('previous_calendar_day','rolling_hours')),
+    rolling_hours INTEGER NOT NULL DEFAULT 24,
+    send_when_empty INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    enabled_at TEXT,
+    next_run_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_digest_rules_due
+    ON daily_digest_rules(enabled, next_run_at, id);
+CREATE TABLE IF NOT EXISTS daily_digest_rule_persons (
+    rule_id INTEGER NOT NULL REFERENCES daily_digest_rules(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES public_figures(id) ON DELETE CASCADE,
+    PRIMARY KEY(rule_id, person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_digest_rule_persons_person
+    ON daily_digest_rule_persons(person_id, rule_id);
+CREATE TABLE IF NOT EXISTS daily_digest_rule_recipients (
+    rule_id INTEGER NOT NULL REFERENCES daily_digest_rules(id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    PRIMARY KEY(rule_id, recipient)
+);
+CREATE TABLE IF NOT EXISTS daily_digest_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL REFERENCES daily_digest_rules(id) ON DELETE RESTRICT,
+    scheduled_date TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('scheduled','manual')),
+    status TEXT NOT NULL
+        CHECK(status IN ('pending','empty','sending','sent','partial','failed','skipped')),
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    batch_count INTEGER NOT NULL DEFAULT 0,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    missed_count INTEGER NOT NULL DEFAULT 0,
+    error_summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(rule_id, scheduled_date)
+);
+CREATE INDEX IF NOT EXISTS idx_digest_runs_rule
+    ON daily_digest_runs(rule_id, scheduled_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_digest_runs_status
+    ON daily_digest_runs(status, id);
+CREATE TABLE IF NOT EXISTS daily_digest_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES daily_digest_runs(id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    part_number INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','retrying','sent','failed','skipped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id, recipient, part_number)
+);
+CREATE INDEX IF NOT EXISTS idx_digest_batches_due
+    ON daily_digest_batches(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_digest_batches_run
+    ON daily_digest_batches(run_id, id);
+CREATE TABLE IF NOT EXISTS daily_digest_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES daily_digest_batches(id) ON DELETE CASCADE,
+    run_id INTEGER NOT NULL REFERENCES daily_digest_runs(id) ON DELETE CASCADE,
+    event_id INTEGER REFERENCES timeline_events(id) ON DELETE SET NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sent','skipped')),
+    skip_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, event_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_digest_items_batch
+    ON daily_digest_items(batch_id, id);
 """
 
 
@@ -409,6 +498,10 @@ class Database:
             if not connection.execute("SELECT 1 FROM schema_version WHERE version=5").fetchone():
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(5, datetime('now'))"
+                )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=6").fetchone():
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(6, datetime('now'))"
                 )
 
     @contextmanager

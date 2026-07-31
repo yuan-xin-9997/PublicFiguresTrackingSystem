@@ -29,6 +29,11 @@ pipeline {
                 }
             }
         }
+        stage('OpenSpec validation') {
+            steps {
+                sh 'openspec validate add-daily-timeline-digest --strict'
+            }
+        }
         stage('Stop current service') {
             steps {
                 sh 'if [ -x "$DEPLOY_DIR/stop.sh" ]; then "$DEPLOY_DIR/stop.sh"; fi'

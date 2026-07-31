@@ -87,11 +87,14 @@ def test_notification_migration_is_repeatable_and_preserves_existing_rows(tmp_pa
     )
     db.initialize()
     assert db.fetch_one("SELECT name FROM public_figures")["name"] == "保留人物"
-    assert db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")["version"] == 5
+    assert db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")["version"] == 6
     expected = {
         "notification_settings", "notification_rules", "notification_rule_tasks",
         "notification_rule_persons",
         "task_run_events", "email_delivery_batches", "email_delivery_items",
+        "daily_digest_rules", "daily_digest_rule_persons",
+        "daily_digest_rule_recipients", "daily_digest_runs",
+        "daily_digest_batches", "daily_digest_items",
     }
     actual = {row["name"] for row in db.fetch_all("SELECT name FROM sqlite_master WHERE type='table'")}
     assert expected <= actual

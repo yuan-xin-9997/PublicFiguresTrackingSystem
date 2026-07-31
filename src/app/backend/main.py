@@ -5,7 +5,7 @@ import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,6 +17,18 @@ from pydantic import BaseModel, Field
 
 from .collectors import _article_rejection_reason, collect_source
 from .config import Settings, load_config
+from .daily_digest import (
+    DailyDigestScheduler,
+    create_digest_run,
+    delete_digest_rule,
+    effective_digest_config,
+    get_digest_rule,
+    list_digest_rules,
+    mask_digest_rule,
+    normalize_digest_config,
+    preview_digest,
+    save_digest_rule,
+)
 from .database import Database, json_text
 from .notifications import (
     EVENT_TYPES,
@@ -148,6 +160,22 @@ class NotificationRuleBody(BaseModel):
     enabled: bool = True
 
 
+class DailyDigestRuleBody(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    person_ids: List[int]
+    event_types: List[str]
+    recipients: List[str]
+    send_time: Optional[str] = Field(default=None, max_length=5)
+    window_mode: Optional[str] = None
+    rolling_hours: Optional[int] = None
+    send_when_empty: bool = False
+    enabled: bool = True
+
+
+class DailyDigestDateBody(BaseModel):
+    scheduled_date: Optional[str] = Field(default=None, max_length=10)
+
+
 class CleanupNavigationBody(BaseModel):
     dry_run: bool = True
 
@@ -193,10 +221,14 @@ def _client_ip(request: Request) -> str:
 def create_app(config_path: Optional[str] = None) -> FastAPI:
     settings = load_config(config_path)
     normalize_email_config((settings.get("notifications") or {}).get("email") or {})
+    normalize_digest_config(
+        (settings.get("notifications") or {}).get("daily_digest") or {}
+    )
     configure_logging(settings)
     db = Database(settings.path("database", "path"), int(settings.get("database", "busy_timeout_ms", 5000)))
     scheduler_holder: Dict[str, Optional[Scheduler]] = {"instance": None}
     notification_holder: Dict[str, Optional[NotificationWorker]] = {"instance": None}
+    digest_scheduler_holder: Dict[str, Optional[DailyDigestScheduler]] = {"instance": None}
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -204,12 +236,16 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         sync_users(db, settings.path("security", "password_file"))
         notification_holder["instance"] = NotificationWorker(db, settings)
         notification_holder["instance"].start()
+        digest_scheduler_holder["instance"] = DailyDigestScheduler(db, settings)
+        digest_scheduler_holder["instance"].start()
         if settings.get("tasks", "scheduler_enabled", False):
             scheduler_holder["instance"] = Scheduler(db, settings)
             scheduler_holder["instance"].start()
         yield
         if scheduler_holder["instance"]:
             scheduler_holder["instance"].stop()
+        if digest_scheduler_holder["instance"]:
+            digest_scheduler_holder["instance"].stop()
         if notification_holder["instance"]:
             notification_holder["instance"].stop()
 
@@ -842,6 +878,254 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             ip_address=_client_ip(request), summary="删除推送规则",
         )
         return {"ok": True, "id": rule_id}
+
+    @application.get("/api/v1/notifications/digests/config")
+    def daily_digest_config(
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        config, sources = effective_digest_config(settings)
+        return {"config": config, "sources": sources}
+
+    @application.get("/api/v1/notifications/digests/options")
+    def daily_digest_options(
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        config, sources = effective_digest_config(settings)
+        return {
+            "persons": db.fetch_all(
+                "SELECT id,name,organization,title FROM public_figures "
+                "WHERE enabled=1 AND deleted_at IS NULL ORDER BY name,id"
+            ),
+            "event_types": sorted(EVENT_TYPES),
+            "defaults": config,
+            "sources": sources,
+        }
+
+    @application.get("/api/v1/notifications/digests/rules")
+    def daily_digest_rules(
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        reveal = user.get("role") == "admin"
+        items = [
+            mask_digest_rule(item, reveal)
+            for item in list_digest_rules(db)
+        ]
+        return {"items": items, "total": len(items)}
+
+    @application.post("/api/v1/notifications/digests/rules", status_code=201)
+    def create_daily_digest_rule(
+        body: DailyDigestRuleBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            item = save_digest_rule(
+                db, settings, body.name, body.person_ids, body.event_types,
+                body.recipients, enabled=body.enabled, send_time=body.send_time,
+                window_mode=body.window_mode, rolling_hours=body.rolling_hours,
+                send_when_empty=body.send_when_empty,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        audit(
+            db, "create", "daily_digest_rule", item["id"], user["id"],
+            ip_address=_client_ip(request),
+            summary="{}；人物 {}；收件人 {} 个；发送时间 {}".format(
+                item["name"], len(item["person_ids"]), len(item["recipients"]),
+                item["send_time"],
+            ),
+        )
+        return item
+
+    @application.put("/api/v1/notifications/digests/rules/{rule_id}")
+    def update_daily_digest_rule(
+        rule_id: int,
+        body: DailyDigestRuleBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            item = save_digest_rule(
+                db, settings, body.name, body.person_ids, body.event_types,
+                body.recipients, enabled=body.enabled, send_time=body.send_time,
+                window_mode=body.window_mode, rolling_hours=body.rolling_hours,
+                send_when_empty=body.send_when_empty, rule_id=rule_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+        audit(
+            db, "update", "daily_digest_rule", item["id"], user["id"],
+            ip_address=_client_ip(request),
+            summary="{}；人物 {}；收件人 {} 个；发送时间 {}".format(
+                item["name"], len(item["person_ids"]), len(item["recipients"]),
+                item["send_time"],
+            ),
+        )
+        return item
+
+    @application.delete("/api/v1/notifications/digests/rules/{rule_id}")
+    def remove_daily_digest_rule(
+        rule_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        if not delete_digest_rule(db, rule_id):
+            raise HTTPException(404, "日报规则不存在")
+        audit(
+            db, "delete", "daily_digest_rule", rule_id, user["id"],
+            ip_address=_client_ip(request), summary="停用并软删除日报规则",
+        )
+        return {"ok": True, "id": rule_id}
+
+    def _digest_date(value: Optional[str]) -> Optional[date]:
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(422, "业务日期必须是 YYYY-MM-DD")
+
+    @application.post("/api/v1/notifications/digests/rules/{rule_id}/preview")
+    def preview_daily_digest_rule(
+        rule_id: int,
+        body: DailyDigestDateBody,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            return preview_digest(
+                db, settings, rule_id, _digest_date(body.scheduled_date)
+            )
+        except ValueError as exc:
+            raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+
+    @application.post("/api/v1/notifications/digests/rules/{rule_id}/runs")
+    def run_daily_digest_rule(
+        rule_id: int,
+        body: DailyDigestDateBody,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        scheduled_date_value = _digest_date(body.scheduled_date)
+        if scheduled_date_value is None:
+            raise HTTPException(422, "补跑必须指定业务日期")
+        try:
+            item = create_digest_run(
+                db, settings, rule_id, scheduled_date_value, trigger_type="manual"
+            )
+        except ValueError as exc:
+            raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+        audit(
+            db, "run", "daily_digest_run", item["id"], user["id"],
+            ip_address=_client_ip(request),
+            summary="补跑规则 {} 的业务日期 {}".format(
+                rule_id, scheduled_date_value.isoformat()
+            ),
+        )
+        return item
+
+    @application.get("/api/v1/notifications/digests/runs")
+    def daily_digest_runs(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        rule_id: Optional[int] = None,
+        run_status: str = "",
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        clauses: List[str] = []
+        params: List[Any] = []
+        if rule_id is not None:
+            clauses.append("r.rule_id=?")
+            params.append(rule_id)
+        allowed_statuses = {
+            "pending", "empty", "sending", "sent", "partial", "failed", "skipped",
+        }
+        if run_status:
+            if run_status not in allowed_statuses:
+                raise HTTPException(422, "日报运行状态无效")
+            clauses.append("r.status=?")
+            params.append(run_status)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        base = (
+            " FROM daily_digest_runs r "
+            "JOIN daily_digest_rules dr ON dr.id=r.rule_id "
+        )
+        total = int(db.fetch_one(
+            "SELECT COUNT(*) n" + base + where, params
+        )["n"])
+        items = db.fetch_all(
+            "SELECT r.*,dr.name AS rule_name" + base + where
+            + " ORDER BY r.scheduled_date DESC,r.id DESC LIMIT ? OFFSET ?",
+            params + [page_size, (page - 1) * page_size],
+        )
+        return _list_response(items, total, page, page_size)
+
+    @application.get("/api/v1/notifications/digests/runs/{run_id}")
+    def daily_digest_run_detail(
+        run_id: int,
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        item = db.fetch_one(
+            "SELECT r.*,dr.name AS rule_name FROM daily_digest_runs r "
+            "JOIN daily_digest_rules dr ON dr.id=r.rule_id WHERE r.id=?",
+            (run_id,),
+        )
+        if not item:
+            raise HTTPException(404, "日报运行不存在")
+        reveal = user.get("role") == "admin"
+        item["batches"] = db.fetch_all(
+            "SELECT b.*,(SELECT COUNT(*) FROM daily_digest_items i "
+            "WHERE i.batch_id=b.id) AS item_count "
+            "FROM daily_digest_batches b WHERE b.run_id=? ORDER BY b.id",
+            (run_id,),
+        )
+        if not reveal:
+            for batch in item["batches"]:
+                recipient = str(batch["recipient"])
+                batch["recipient"] = "{}***@{}".format(
+                    recipient[:1], recipient.split("@", 1)[1]
+                )
+        item["items"] = db.fetch_all(
+            "SELECT i.*,e.title,e.event_type,e.start_at,p.name AS person_name "
+            "FROM daily_digest_items i "
+            "LEFT JOIN timeline_events e ON e.id=i.event_id "
+            "LEFT JOIN public_figures p ON p.id=e.person_id "
+            "WHERE i.run_id=? ORDER BY e.start_at IS NULL,e.start_at,p.id,e.event_type,e.id",
+            (run_id,),
+        )
+        return item
+
+    @application.post("/api/v1/notifications/digests/batches/{batch_id}/retry")
+    def retry_daily_digest_batch(
+        batch_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        batch = db.fetch_one(
+            "SELECT id,run_id,status FROM daily_digest_batches WHERE id=?",
+            (batch_id,),
+        )
+        if not batch:
+            raise HTTPException(404, "日报投递批次不存在")
+        if batch["status"] != "failed":
+            raise HTTPException(409, "只有失败批次可以手工重试")
+        now = utc_now()
+        db.execute(
+            "UPDATE daily_digest_batches SET status='retrying',attempt_count=0,"
+            "next_attempt_at=?,last_error='',updated_at=? WHERE id=?",
+            (now, now, batch_id),
+        )
+        db.execute(
+            "UPDATE daily_digest_runs SET status='pending',error_summary='',updated_at=? "
+            "WHERE id=?",
+            (now, batch["run_id"]),
+        )
+        audit(
+            db, "retry", "daily_digest_batch", batch_id, user["id"],
+            ip_address=_client_ip(request), summary="手工重试失败日报批次",
+        )
+        return db.fetch_one(
+            "SELECT * FROM daily_digest_batches WHERE id=?", (batch_id,)
+        )
 
     @application.get("/api/v1/notifications/deliveries")
     def notification_deliveries(
