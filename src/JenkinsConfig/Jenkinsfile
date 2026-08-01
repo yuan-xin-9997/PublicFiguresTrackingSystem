@@ -31,7 +31,7 @@ pipeline {
         }
         stage('OpenSpec validation') {
             steps {
-                sh 'openspec validate schedule-incremental-event-push --type change --strict'
+                sh 'npx --yes @fission-ai/openspec@1.6.0 validate schedule-incremental-event-push --type change --strict'
             }
         }
         stage('Stop current service') {
