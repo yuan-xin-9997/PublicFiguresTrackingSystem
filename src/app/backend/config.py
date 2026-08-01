@@ -72,6 +72,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "default_rolling_hours": 24,
             "max_rolling_hours": 168,
             "scheduler_poll_seconds": 30,
+        },
+        "scheduled_incremental": {
+            "timezone": "Asia/Shanghai",
+            "default_send_times": ["08:30"],
+            "scheduler_poll_seconds": 30,
         }
     },
     "logging": {"level": "INFO", "retention_days": 30, "path": "logs/app.log"},

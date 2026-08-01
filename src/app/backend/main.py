@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -44,6 +45,13 @@ from .notifications import (
     send_test_email,
 )
 from .scheduler import Scheduler
+from .scheduled_incremental import (
+    ScheduledIncrementalScheduler,
+    create_incremental_run,
+    effective_incremental_config,
+    normalize_incremental_config,
+    preview_incremental,
+)
 from .security import (
     ALL_PAGES, create_session, current_user, parse_password_file, require_admin, require_page,
     revoke_session, sync_users, user_pages, utc_now, verify_password,
@@ -158,6 +166,8 @@ class NotificationRuleBody(BaseModel):
     person_ids: List[int] = Field(default_factory=list)
     event_types: List[str]
     enabled: bool = True
+    delivery_mode: str = "immediate"
+    send_times: List[str] = Field(default_factory=list)
 
 
 class DailyDigestRuleBody(BaseModel):
@@ -224,11 +234,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     normalize_digest_config(
         (settings.get("notifications") or {}).get("daily_digest") or {}
     )
+    normalize_incremental_config(
+        (settings.get("notifications") or {}).get("scheduled_incremental") or {}
+    )
     configure_logging(settings)
     db = Database(settings.path("database", "path"), int(settings.get("database", "busy_timeout_ms", 5000)))
     scheduler_holder: Dict[str, Optional[Scheduler]] = {"instance": None}
     notification_holder: Dict[str, Optional[NotificationWorker]] = {"instance": None}
     digest_scheduler_holder: Dict[str, Optional[DailyDigestScheduler]] = {"instance": None}
+    incremental_scheduler_holder: Dict[str, Optional[ScheduledIncrementalScheduler]] = {
+        "instance": None
+    }
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -238,6 +254,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         notification_holder["instance"].start()
         digest_scheduler_holder["instance"] = DailyDigestScheduler(db, settings)
         digest_scheduler_holder["instance"].start()
+        incremental_scheduler_holder["instance"] = ScheduledIncrementalScheduler(db, settings)
+        incremental_scheduler_holder["instance"].start()
         if settings.get("tasks", "scheduler_enabled", False):
             scheduler_holder["instance"] = Scheduler(db, settings)
             scheduler_holder["instance"].start()
@@ -246,6 +264,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             scheduler_holder["instance"].stop()
         if digest_scheduler_holder["instance"]:
             digest_scheduler_holder["instance"].stop()
+        if incremental_scheduler_holder["instance"]:
+            incremental_scheduler_holder["instance"].stop()
         if notification_holder["instance"]:
             notification_holder["instance"].stop()
 
@@ -834,13 +854,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         try:
             item = save_rule(
                 db, body.name, body.task_ids, body.event_types, body.enabled,
-                person_ids=body.person_ids,
+                person_ids=body.person_ids, delivery_mode=body.delivery_mode,
+                send_times=body.send_times or None, settings=settings,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         audit(
             db, "create", "notification_rule", item["id"], user["id"],
-            ip_address=_client_ip(request), summary=item["name"],
+            ip_address=_client_ip(request),
+            summary="{}；模式 {}；游标重置 {}".format(
+                item["name"], item["delivery_mode"], item.get("cursor_reset", False)
+            ),
         )
         return item
 
@@ -855,13 +879,18 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             item = save_rule(
                 db, body.name, body.task_ids, body.event_types, body.enabled,
                 rule_id=rule_id, person_ids=body.person_ids,
+                delivery_mode=body.delivery_mode, send_times=body.send_times or None,
+                settings=settings,
             )
         except ValueError as exc:
             status_code = 404 if "不存在" in str(exc) else 422
             raise HTTPException(status_code, str(exc))
         audit(
             db, "update", "notification_rule", item["id"], user["id"],
-            ip_address=_client_ip(request), summary=item["name"],
+            ip_address=_client_ip(request),
+            summary="{}；模式 {}；游标重置 {}".format(
+                item["name"], item["delivery_mode"], item.get("cursor_reset", False)
+            ),
         )
         return item
 
@@ -878,6 +907,152 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             ip_address=_client_ip(request), summary="删除推送规则",
         )
         return {"ok": True, "id": rule_id}
+
+    @application.get("/api/v1/notifications/incremental/config")
+    def incremental_notification_config(
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        config, sources = effective_incremental_config(settings)
+        return {"config": config, "sources": sources}
+
+    @application.post("/api/v1/notifications/rules/{rule_id}/preview")
+    def preview_incremental_rule(
+        rule_id: int,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            return preview_incremental(db, rule_id)
+        except ValueError as exc:
+            raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+
+    @application.post("/api/v1/notifications/rules/{rule_id}/run-now")
+    def run_incremental_rule_now(
+        rule_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        try:
+            item = create_incremental_run(
+                db, settings, rule_id, trigger_type="manual", triggered_by=int(user["id"])
+            )
+        except ValueError as exc:
+            raise HTTPException(404 if "不存在" in str(exc) else 422, str(exc))
+        audit(
+            db, "run", "scheduled_notification_run", item["id"], user["id"],
+            ip_address=_client_ip(request),
+            summary="立即汇总规则 {}；候选 {}；截止 {}".format(
+                rule_id, item["candidate_count"], item["upper_created_at"] or "起点"
+            ),
+        )
+        return item
+
+    @application.get("/api/v1/notifications/incremental/runs")
+    def incremental_notification_runs(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        rule_id: Optional[int] = None,
+        run_status: str = "",
+        scheduled_from: str = "",
+        scheduled_to: str = "",
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        clauses: List[str] = []
+        params: List[Any] = []
+        if rule_id is not None:
+            clauses.append("r.rule_id=?")
+            params.append(rule_id)
+        allowed = {"pending", "empty", "sending", "sent", "partial", "failed", "skipped"}
+        if run_status:
+            if run_status not in allowed:
+                raise HTTPException(422, "定时增量运行状态无效")
+            clauses.append("r.status=?")
+            params.append(run_status)
+        for field, value, operator in (
+            ("scheduled_from", scheduled_from, ">="), ("scheduled_to", scheduled_to, "<=")
+        ):
+            if value:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    raise HTTPException(422, "{} 必须是 ISO 时间".format(field))
+                if parsed.tzinfo is None:
+                    incremental_config, _ = effective_incremental_config(settings)
+                    parsed = parsed.replace(tzinfo=ZoneInfo(incremental_config["timezone"]))
+                clauses.append("r.scheduled_at{}?".format(operator))
+                params.append(parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat())
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        base = (
+            " FROM scheduled_notification_runs r JOIN notification_rules nr ON nr.id=r.rule_id "
+        )
+        total = int(db.fetch_one("SELECT COUNT(*) n" + base + where, params)["n"])
+        items = db.fetch_all(
+            "SELECT r.*,nr.name AS rule_name" + base + where
+            + " ORDER BY r.scheduled_at DESC,r.id DESC LIMIT ? OFFSET ?",
+            params + [page_size, (page - 1) * page_size],
+        )
+        return _list_response(items, total, page, page_size)
+
+    @application.get("/api/v1/notifications/incremental/runs/{run_id}")
+    def incremental_notification_run_detail(
+        run_id: int,
+        user: Dict[str, Any] = Depends(require_page("notifications")),
+    ):
+        item = db.fetch_one(
+            "SELECT r.*,nr.name AS rule_name FROM scheduled_notification_runs r "
+            "JOIN notification_rules nr ON nr.id=r.rule_id WHERE r.id=?", (run_id,)
+        )
+        if not item:
+            raise HTTPException(404, "定时增量运行不存在")
+        reveal = user.get("role") == "admin"
+        batches = db.fetch_all(
+            "SELECT b.*,(SELECT COUNT(*) FROM scheduled_notification_items i "
+            "WHERE i.batch_id=b.id) item_count FROM scheduled_notification_batches b "
+            "WHERE b.run_id=? ORDER BY b.id", (run_id,)
+        )
+        if not reveal:
+            for batch in batches:
+                address = str(batch["recipient"])
+                batch["recipient"] = "{}***@{}".format(
+                    address[:1], address.split("@", 1)[1]
+                ) if "@" in address else "***"
+        item["batches"] = batches
+        item["items"] = db.fetch_all(
+            "SELECT i.*,e.event_type,e.title,e.start_at,p.name AS person_name "
+            "FROM scheduled_notification_items i LEFT JOIN timeline_events e ON e.id=i.event_id "
+            "LEFT JOIN public_figures p ON p.id=e.person_id WHERE i.run_id=? "
+            "ORDER BY i.id LIMIT 1000", (run_id,)
+        )
+        return item
+
+    @application.post("/api/v1/notifications/incremental/batches/{batch_id}/retry")
+    def retry_incremental_batch(
+        batch_id: int,
+        request: Request,
+        user: Dict[str, Any] = Depends(require_admin),
+    ):
+        batch = db.fetch_one(
+            "SELECT * FROM scheduled_notification_batches WHERE id=?", (batch_id,)
+        )
+        if not batch:
+            raise HTTPException(404, "定时增量批次不存在")
+        if batch["status"] != "failed":
+            raise HTTPException(409, "只有失败终止的批次可以重试")
+        now = utc_now()
+        with db.transaction() as connection:
+            connection.execute(
+                "UPDATE scheduled_notification_batches SET status='retrying',attempt_count=0,"
+                "next_attempt_at=?,last_error='',updated_at=? WHERE id=? AND status='failed'",
+                (now, now, batch_id),
+            )
+            connection.execute(
+                "UPDATE scheduled_notification_items SET status='pending',skip_reason='' "
+                "WHERE batch_id=? AND status!='sent'", (batch_id,),
+            )
+        audit(
+            db, "retry", "scheduled_notification_batch", batch_id, user["id"],
+            ip_address=_client_ip(request), summary="重试原定时增量批次",
+        )
+        return {"ok": True, "id": batch_id, "status": "retrying"}
 
     @application.get("/api/v1/notifications/digests/config")
     def daily_digest_config(

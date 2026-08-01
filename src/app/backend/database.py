@@ -235,7 +235,16 @@ CREATE TABLE IF NOT EXISTS notification_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     event_types_json TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL DEFAULT 'immediate'
+        CHECK(delivery_mode IN ('immediate','scheduled_incremental')),
+    send_times_json TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
+    enabled_at TEXT,
+    next_run_at TEXT,
+    cursor_created_at TEXT NOT NULL DEFAULT '',
+    cursor_run_id INTEGER NOT NULL DEFAULT 0,
+    cursor_event_id INTEGER NOT NULL DEFAULT 0,
+    deleted_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -260,6 +269,8 @@ CREATE TABLE IF NOT EXISTS task_run_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_run_events_event ON task_run_events(event_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_task_run_events_created ON task_run_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_watermark
+    ON task_run_events(created_at,run_id,event_id);
 CREATE TABLE IF NOT EXISTS email_delivery_batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_run_id INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
@@ -379,6 +390,68 @@ CREATE TABLE IF NOT EXISTS daily_digest_items (
 );
 CREATE INDEX IF NOT EXISTS idx_digest_items_batch
     ON daily_digest_items(batch_id, id);
+CREATE TABLE IF NOT EXISTS scheduled_notification_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL REFERENCES notification_rules(id) ON DELETE RESTRICT,
+    scheduled_at TEXT NOT NULL,
+    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('scheduled','manual')),
+    lower_created_at TEXT NOT NULL DEFAULT '',
+    lower_run_id INTEGER NOT NULL DEFAULT 0,
+    lower_event_id INTEGER NOT NULL DEFAULT 0,
+    upper_created_at TEXT NOT NULL DEFAULT '',
+    upper_run_id INTEGER NOT NULL DEFAULT 0,
+    upper_event_id INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN ('pending','empty','sending','sent','partial','failed','skipped')),
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    batch_count INTEGER NOT NULL DEFAULT 0,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    missed_count INTEGER NOT NULL DEFAULT 0,
+    triggered_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    error_summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(rule_id,scheduled_at)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_rule
+    ON scheduled_notification_runs(rule_id,scheduled_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
+    ON scheduled_notification_runs(status,id);
+CREATE TABLE IF NOT EXISTS scheduled_notification_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES scheduled_notification_runs(id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    part_number INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','retrying','sent','failed','skipped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id,recipient,part_number)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_batches_due
+    ON scheduled_notification_batches(status,next_attempt_at,id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_batches_run
+    ON scheduled_notification_batches(run_id,id);
+CREATE TABLE IF NOT EXISTS scheduled_notification_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES scheduled_notification_batches(id) ON DELETE CASCADE,
+    run_id INTEGER NOT NULL REFERENCES scheduled_notification_runs(id) ON DELETE CASCADE,
+    event_id INTEGER REFERENCES timeline_events(id) ON DELETE SET NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','skipped')),
+    skip_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id,event_id,recipient)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_items_batch
+    ON scheduled_notification_items(batch_id,id);
 """
 
 
@@ -503,12 +576,48 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(6, datetime('now'))"
                 )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=7").fetchone():
+                rule_columns = {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(notification_rules)"
+                    ).fetchall()
+                }
+                additions = {
+                    "delivery_mode": "TEXT NOT NULL DEFAULT 'immediate'",
+                    "send_times_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "enabled_at": "TEXT",
+                    "next_run_at": "TEXT",
+                    "cursor_created_at": "TEXT NOT NULL DEFAULT ''",
+                    "cursor_run_id": "INTEGER NOT NULL DEFAULT 0",
+                    "cursor_event_id": "INTEGER NOT NULL DEFAULT 0",
+                    "deleted_at": "TEXT",
+                }
+                for name, declaration in additions.items():
+                    if name not in rule_columns:
+                        connection.execute(
+                            "ALTER TABLE notification_rules ADD COLUMN {} {}".format(
+                                name, declaration
+                            )
+                        )
+                connection.execute(
+                    "UPDATE notification_rules SET delivery_mode='immediate' "
+                    "WHERE delivery_mode IS NULL OR delivery_mode=''"
+                )
+                connection.executescript("""
+                    CREATE INDEX IF NOT EXISTS idx_notification_rules_due
+                        ON notification_rules(delivery_mode,enabled,next_run_at,id);
+                    CREATE INDEX IF NOT EXISTS idx_task_run_events_watermark
+                        ON task_run_events(created_at,run_id,event_id);
+                """)
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(7, datetime('now'))"
+                )
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
         try:
-            connection.execute("BEGIN")
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield connection
             connection.commit()
         except Exception:

@@ -1,0 +1,21 @@
+[Unit]
+Description=Public Figures Tracking System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+WorkingDirectory=__DEPLOY_DIR__
+Environment=PYTHONPATH=__DEPLOY_DIR__
+EnvironmentFile=-__DEPLOY_DIR__/data/runtime.env
+ExecStart=__DEPLOY_DIR__/.venv/bin/python -m app.backend.main
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

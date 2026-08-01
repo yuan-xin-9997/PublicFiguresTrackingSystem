@@ -37,7 +37,9 @@ const App = {
       deliveries: [], deliveryTotal: 0, selectedDelivery: null,
       digestConfig: null, digestRules: [], digestRuns: [],
       digestOptions: { persons: [], event_types: [], defaults: {} },
-      digestPreview: null, selectedDigestRun: null
+      digestPreview: null, selectedDigestRun: null,
+      incrementalConfig: null, incrementalRuns: [], incrementalPreview: null,
+      selectedIncrementalRun: null
     })
     const filters = reactive({
       q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '',
@@ -60,7 +62,10 @@ const App = {
       max_events_per_message: 25, worker_poll_seconds: 15, max_attempts: 5,
       retry_base_seconds: 60, timeout_seconds: 15, password: '', clear_password: false
     })
-    const ruleForm = reactive({ name: '', task_ids: [], person_ids: [], event_types: [], enabled: true })
+    const ruleForm = reactive({
+      name: '', task_ids: [], person_ids: [], event_types: [], enabled: true,
+      delivery_mode: 'immediate', send_times: ['08:30']
+    })
     const editingRuleId = ref(null)
     const rulePersonSearch = ref('')
     const digestForm = reactive({
@@ -73,6 +78,7 @@ const App = {
     const digestPreviewDate = ref('')
     const digestRunFilters = reactive({ rule_id: '', run_status: '' })
     const deliveryFilters = reactive({ task_id: '', delivery_status: '' })
+    const incrementalRunFilters = reactive({ rule_id: '', run_status: '', scheduled_from: '', scheduled_to: '' })
     const searchTerm = ref('')
     const mapEl = ref(null)
     const mapPersonId = ref('')
@@ -167,15 +173,18 @@ const App = {
           data.runs = (await api('/task-runs?page_size=30')).items
           if (user.value.pages.includes('notifications')) {
             data.digestRuns = (await api('/notifications/digests/runs?page_size=10')).items
+            data.incrementalRuns = (await api('/notifications/incremental/runs?page_size=10')).items
           }
           if (user.value.role === 'admin') await loadCommon()
         } else if (active.value === 'notifications') {
-          const [configResult, rulesResult, optionsResult, deliveriesResult, digestConfigResult, digestRulesResult, digestOptionsResult, digestRunsResult] = await Promise.all([
+          const [configResult, rulesResult, optionsResult, deliveriesResult, digestConfigResult, digestRulesResult, digestOptionsResult, digestRunsResult, incrementalConfigResult, incrementalRunsResult] = await Promise.all([
             api('/notifications/email/config'), api('/notifications/rules'), api('/notifications/options'),
             api(`/notifications/deliveries?${queryString({ page_size: 50, ...deliveryFilters })}`),
             api('/notifications/digests/config'), api('/notifications/digests/rules'),
             api('/notifications/digests/options'),
-            api(`/notifications/digests/runs?${queryString({ page_size: 50, ...digestRunFilters })}`)
+            api(`/notifications/digests/runs?${queryString({ page_size: 50, ...digestRunFilters })}`),
+            api('/notifications/incremental/config'),
+            api(`/notifications/incremental/runs?${queryString({ page_size: 50, ...incrementalRunFilters })}`)
           ])
           data.notificationConfig = configResult
           data.notificationRules = rulesResult.items
@@ -186,6 +195,11 @@ const App = {
           data.digestRules = digestRulesResult.items
           data.digestOptions = digestOptionsResult
           data.digestRuns = digestRunsResult.items
+          data.incrementalConfig = incrementalConfigResult
+          data.incrementalRuns = incrementalRunsResult.items
+          if (!editingRuleId.value && ruleForm.delivery_mode === 'scheduled_incremental') {
+            ruleForm.send_times = [...(incrementalConfigResult.config.default_send_times || ['08:30'])]
+          }
           if (!editingDigestRuleId.value) {
             const defaults = digestOptionsResult.defaults || {}
             digestForm.send_time = defaults.default_send_time || '08:30'
@@ -378,7 +392,11 @@ const App = {
     }
 
     function resetRuleForm() {
-      Object.assign(ruleForm, { name: '', task_ids: [], person_ids: [], event_types: [], enabled: true })
+      Object.assign(ruleForm, {
+        name: '', task_ids: [], person_ids: [], event_types: [], enabled: true,
+        delivery_mode: 'immediate',
+        send_times: [...(data.incrementalConfig?.config?.default_send_times || ['08:30'])]
+      })
       rulePersonSearch.value = ''
       editingRuleId.value = null
     }
@@ -403,18 +421,39 @@ const App = {
       editingRuleId.value = rule.id
       Object.assign(ruleForm, {
         name: rule.name, task_ids: [...rule.task_ids], person_ids: [...(rule.person_ids || [])],
-        event_types: [...rule.event_types], enabled: Boolean(rule.enabled)
+        event_types: [...rule.event_types], enabled: Boolean(rule.enabled),
+        delivery_mode: rule.delivery_mode || 'immediate',
+        send_times: [...(rule.send_times?.length ? rule.send_times : (data.incrementalConfig?.config?.default_send_times || ['08:30']))]
       })
+    }
+
+    function addRuleSendTime() {
+      ruleForm.send_times.push('08:30')
+    }
+
+    function removeRuleSendTime(index) {
+      if (ruleForm.send_times.length > 1) ruleForm.send_times.splice(index, 1)
+    }
+
+    function ruleWillResetCursor(existing) {
+      if (!existing || ruleForm.delivery_mode !== 'scheduled_incremental') return false
+      const same = (a, b) => JSON.stringify([...a].map(Number).sort((x, y) => x - y)) === JSON.stringify([...b].map(Number).sort((x, y) => x - y))
+      const sameTypes = JSON.stringify([...ruleForm.event_types].sort()) === JSON.stringify([...(existing.event_types || [])].sort())
+      return existing.delivery_mode !== ruleForm.delivery_mode || (!existing.enabled && ruleForm.enabled) ||
+        !same(ruleForm.task_ids, existing.task_ids || []) || !same(ruleForm.person_ids, existing.person_ids || []) || !sameTypes
     }
 
     async function saveNotificationRule() {
       await perform(async () => {
         const editing = editingRuleId.value
+        const existing = data.notificationRules.find(rule => rule.id === editing)
+        if (editing && ruleWillResetCursor(existing) && !window.confirm('此次修改会把增量起点重置到当前入库高水位，变更前和停用期间的事件不会补发。是否继续？')) return
         await api(editing ? `/notifications/rules/${editing}` : '/notifications/rules', {
           method: editing ? 'PUT' : 'POST',
           body: JSON.stringify({
             ...ruleForm, task_ids: ruleForm.task_ids.map(Number),
-            person_ids: ruleForm.person_ids.map(Number), event_types: [...ruleForm.event_types]
+            person_ids: ruleForm.person_ids.map(Number), event_types: [...ruleForm.event_types],
+            send_times: ruleForm.delivery_mode === 'scheduled_incremental' ? [...ruleForm.send_times] : []
           })
         })
         resetRuleForm()
@@ -424,12 +463,15 @@ const App = {
     }
 
     async function toggleRule(rule) {
+      if (!rule.enabled && rule.delivery_mode === 'scheduled_incremental' &&
+          !window.confirm('重新启用会从当前入库高水位开始，停用期间事件不会补发。是否继续？')) return
       await perform(async () => {
         await api(`/notifications/rules/${rule.id}`, {
           method: 'PUT',
           body: JSON.stringify({
             name: rule.name, task_ids: rule.task_ids, person_ids: rule.person_ids || [],
-            event_types: rule.event_types, enabled: !rule.enabled
+            event_types: rule.event_types, enabled: !rule.enabled,
+            delivery_mode: rule.delivery_mode || 'immediate', send_times: rule.send_times || []
           })
         })
         await loadPage()
@@ -442,6 +484,38 @@ const App = {
         await api(`/notifications/rules/${rule.id}`, { method: 'DELETE' })
         if (editingRuleId.value === rule.id) resetRuleForm()
         flash('推送规则已删除')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function previewIncrementalRule(rule = null) {
+      const targetId = rule?.id || editingRuleId.value
+      if (!targetId) { error.value = '请先保存定时增量规则，再预览待推窗口'; return }
+      await perform(async () => {
+        data.incrementalPreview = await api(`/notifications/rules/${targetId}/preview`, { method: 'POST' })
+      }).catch(() => {})
+    }
+
+    async function runIncrementalRule(rule) {
+      if (!window.confirm(`立即汇总“${rule.name}”自上次截止点以来的新增事件，并推进增量游标吗？`)) return
+      await perform(async () => {
+        await api(`/notifications/rules/${rule.id}/run-now`, { method: 'POST' })
+        flash('定时增量汇总已创建')
+        await loadPage()
+      }).catch(() => {})
+    }
+
+    async function openIncrementalRun(id) {
+      await perform(async () => {
+        data.selectedIncrementalRun = await api(`/notifications/incremental/runs/${id}`)
+      }).catch(() => {})
+    }
+
+    async function retryIncrementalBatch(id) {
+      await perform(async () => {
+        await api(`/notifications/incremental/batches/${id}/retry`, { method: 'POST' })
+        data.selectedIncrementalRun = null
+        flash('定时增量批次已重新排队')
         await loadPage()
       }).catch(() => {})
     }
@@ -634,10 +708,10 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      maintenance, emailForm, ruleForm, editingRuleId, rulePersonSearch, visibleRulePersons, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      maintenance, emailForm, ruleForm, editingRuleId, rulePersonSearch, visibleRulePersons, deliveryFilters, incrementalRunFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestPreviewDate, digestRunFilters,
       login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
-      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, selectAllRulePersons, clearRulePersons, toggleRule, removeRule,
+      runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, selectAllRulePersons, clearRulePersons, addRuleSendTime, removeRuleSendTime, toggleRule, removeRule, previewIncrementalRule, runIncrementalRule, openIncrementalRun, retryIncrementalBatch,
       saveDigestRule, editDigestRule, resetDigestForm, selectAllDigestPersons, clearDigestPersons, previewDigestRule, toggleDigestRule, removeDigestRule, runDigestRule, openDigestRun, retryDigestBatch,
       openDelivery, retryDelivery, review, savePermissions, searchNow
     }
@@ -871,7 +945,14 @@ const App = {
             <div class="section-title"><h3>{{ editingRuleId ? '编辑推送规则' : '新增推送规则' }}</h3><button v-if="editingRuleId" @click="resetRuleForm">取消编辑</button></div>
             <form class="form-grid notification-form" @submit.prevent="saveNotificationRule">
               <label>规则名称<input v-model="ruleForm.name" required /></label>
+              <label>投递模式<select v-model="ruleForm.delivery_mode"><option value="immediate">即时推送</option><option value="scheduled_incremental">定时增量汇总</option></select></label>
               <label class="check-line"><input v-model="ruleForm.enabled" type="checkbox" />启用规则</label>
+              <fieldset v-if="ruleForm.delivery_mode==='scheduled_incremental'" class="send-time-picker span-two">
+                <legend>每日发送时刻（北京时间）</legend>
+                <div v-for="(sendTime,index) in ruleForm.send_times" :key="index" class="send-time-row"><input v-model="ruleForm.send_times[index]" type="time" required /><button type="button" :disabled="ruleForm.send_times.length===1" @click="removeRuleSendTime(index)">移除</button></div>
+                <button type="button" @click="addRuleSendTime">添加发送时刻</button>
+                <p class="form-hint">每次汇总上一个入库截止点以后新建的匹配事件；新建、重新启用或改变范围时从当前高水位开始，不补发历史。</p>
+              </fieldset>
               <fieldset class="task-picker span-two">
                 <legend>采集任务（已选择 {{ ruleForm.task_ids.length }} 项）</legend>
                 <div class="task-picker-actions"><button type="button" @click="selectAllRuleTasks">全选</button><button type="button" @click="clearRuleTasks">清空</button></div>
@@ -897,15 +978,28 @@ const App = {
                 <p v-else-if="!visibleRulePersons.length" class="form-hint person-scope-hint">没有符合搜索条件的人物。</p>
               </fieldset>
               <fieldset><legend>事件类型</legend><label v-for="type in data.notificationOptions.event_types" :key="type" class="check-line"><input v-model="ruleForm.event_types" type="checkbox" :value="type" />{{ eventLabels[type] }}</label></fieldset>
-              <button class="primary">{{ editingRuleId ? '保存规则' : '创建规则' }}</button>
+              <div class="notification-actions"><button class="primary">{{ editingRuleId ? '保存规则' : '创建规则' }}</button><button v-if="editingRuleId && ruleForm.delivery_mode==='scheduled_incremental'" type="button" @click="previewIncrementalRule()">预览待推窗口</button></div>
             </form>
+            <div v-if="data.incrementalPreview" class="incremental-preview" aria-live="polite">
+              <strong>待推 {{ data.incrementalPreview.candidate_count }} 条事件</strong>
+              <span>下界：{{ formatBeijing(data.incrementalPreview.lower.created_at) }} · 上界：{{ formatBeijing(data.incrementalPreview.upper.created_at) }}</span>
+              <ul><li v-for="item in data.incrementalPreview.sample" :key="item.id">{{ item.person_name }} · {{ item.title }}</li></ul>
+            </div>
           </section>
 
           <section class="panel">
             <div class="section-title"><h3>推送规则</h3><span>{{ data.notificationRules.length }} 条</span></div>
-            <table><thead><tr><th>规则</th><th>任务</th><th>人物</th><th>事件类型</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
-              <tr v-for="rule in data.notificationRules" :key="rule.id"><td><strong>{{ rule.name }}</strong></td><td>{{ rule.task_ids.map(id => data.notificationOptions.tasks.find(task => task.id===id)?.name || '#'+id).join('、') }}</td><td>{{ !rule.person_ids?.length ? '全部人物' : rule.person_ids.map(id => data.notificationOptions.persons.find(person => person.id===id)?.name || '#'+id).join('、') }}</td><td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td><td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td><td v-if="user.role==='admin'"><div class="table-actions"><button @click="editRule(rule)">编辑</button><button @click="toggleRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeRule(rule)">删除</button></div></td></tr>
+            <table><thead><tr><th>规则/模式</th><th>任务</th><th>人物</th><th>事件类型</th><th>发送/下次运行</th><th>状态</th><th v-if="user.role==='admin'"></th></tr></thead><tbody>
+              <tr v-for="rule in data.notificationRules" :key="rule.id"><td><strong>{{ rule.name }}</strong><small>{{ rule.delivery_mode==='scheduled_incremental' ? '定时增量' : '即时推送' }}</small></td><td>{{ rule.task_ids.map(id => data.notificationOptions.tasks.find(task => task.id===id)?.name || '#'+id).join('、') }}</td><td>{{ !rule.person_ids?.length ? '全部人物' : rule.person_ids.map(id => data.notificationOptions.persons.find(person => person.id===id)?.name || '#'+id).join('、') }}</td><td>{{ rule.event_types.map(type => eventLabels[type]).join('、') }}</td><td><template v-if="rule.delivery_mode==='scheduled_incremental'">{{ rule.send_times.join('、') }}<small>下次：{{ formatBeijing(rule.next_run_at) }}</small><small>上次截止：{{ formatBeijing(rule.cursor_created_at) }}</small></template><span v-else>任务结束后</span></td><td><span class="status">{{ rule.enabled ? '启用' : '停用' }}</span></td><td v-if="user.role==='admin'"><div class="table-actions"><button @click="editRule(rule)">编辑</button><button v-if="rule.delivery_mode==='scheduled_incremental'" @click="previewIncrementalRule(rule)">预览</button><button v-if="rule.delivery_mode==='scheduled_incremental'" @click="runIncrementalRule(rule)">立即汇总</button><button @click="toggleRule(rule)">{{ rule.enabled ? '停用' : '启用' }}</button><button class="delete-link" @click="removeRule(rule)">删除</button></div></td></tr>
             </tbody></table><p v-if="!data.notificationRules.length" class="empty">尚未创建推送规则。</p>
+          </section>
+
+          <section class="panel incremental-runs-panel">
+            <div class="section-title"><h3>定时增量运行</h3><span>按入库高水位切分，不按事件发生日期</span></div>
+            <div class="toolbar incremental-toolbar"><select v-model="incrementalRunFilters.rule_id"><option value="">全部定时规则</option><option v-for="rule in data.notificationRules.filter(item=>item.delivery_mode==='scheduled_incremental')" :value="rule.id">{{ rule.name }}</option></select><select v-model="incrementalRunFilters.run_status"><option value="">全部状态</option><option v-for="status in ['pending','empty','sending','sent','partial','failed','skipped']" :value="status">{{ status }}</option></select><input v-model="incrementalRunFilters.scheduled_from" type="datetime-local" aria-label="计划时间起点" /><input v-model="incrementalRunFilters.scheduled_to" type="datetime-local" aria-label="计划时间终点" /><button @click="loadPage">筛选</button></div>
+            <table><thead><tr><th>计划时间</th><th>规则</th><th>入库窗口</th><th>候选/批次</th><th>发送/失败/跳过</th><th>状态</th><th>触发</th></tr></thead><tbody>
+              <tr v-for="run in data.incrementalRuns" :key="run.id" class="clickable-row" tabindex="0" @click="openIncrementalRun(run.id)" @keyup.enter="openIncrementalRun(run.id)"><td>{{ formatBeijing(run.scheduled_at) }}</td><td>{{ run.rule_name }}</td><td>{{ formatBeijing(run.lower_created_at) }}<small>至 {{ formatBeijing(run.upper_created_at) }}</small></td><td>{{ run.candidate_count }} / {{ run.batch_count }}</td><td>{{ run.sent_count }} / {{ run.failed_count }} / {{ run.skipped_count }}</td><td><span class="status">{{ run.status }}</span></td><td>{{ run.trigger_type==='manual' ? '立即汇总' : '自动调度' }}</td></tr>
+            </tbody></table><p v-if="!data.incrementalRuns.length" class="empty">暂无定时增量运行记录。</p>
           </section>
 
           <section class="panel">
@@ -934,6 +1028,7 @@ const App = {
 
           <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="primary" @click="review(data.selectedEvent.id,'approve')">通过审核</button><button class="danger" @click="review(data.selectedEvent.id,'reject')">驳回</button></div></section></aside>
           <aside v-if="data.selectedDigestRun" class="detail-overlay" @click.self="data.selectedDigestRun=null"><section class="detail-panel"><button class="close" @click="data.selectedDigestRun=null">×</button><p class="eyebrow">DAILY TIMELINE DIGEST</p><h2>{{ data.selectedDigestRun.rule_name }} · {{ data.selectedDigestRun.scheduled_date }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDigestRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedDigestRun.trigger_type==='manual' ? '手工补跑' : '自动调度' }}</strong></div><div><small>窗口开始</small><strong>{{ formatBeijing(data.selectedDigestRun.window_start) }}</strong></div><div><small>窗口结束</small><strong>{{ formatBeijing(data.selectedDigestRun.window_end) }}</strong></div></div><p v-if="data.selectedDigestRun.error_summary" class="error">{{ data.selectedDigestRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedDigestRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryDigestBatch(batch.id)">重新投递</button></article><h3>时间线明细</h3><article class="evidence" v-for="item in data.selectedDigestRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
+          <aside v-if="data.selectedIncrementalRun" class="detail-overlay" @click.self="data.selectedIncrementalRun=null"><section class="detail-panel"><button class="close" aria-label="关闭" @click="data.selectedIncrementalRun=null">×</button><p class="eyebrow">SCHEDULED INCREMENTAL PUSH</p><h2>{{ data.selectedIncrementalRun.rule_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedIncrementalRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedIncrementalRun.trigger_type==='manual' ? '立即汇总' : '自动调度' }}</strong></div><div><small>入库窗口开始</small><strong>{{ formatBeijing(data.selectedIncrementalRun.lower_created_at) }}</strong></div><div><small>入库窗口结束</small><strong>{{ formatBeijing(data.selectedIncrementalRun.upper_created_at) }}</strong></div><div><small>候选 / 批次</small><strong>{{ data.selectedIncrementalRun.candidate_count }} / {{ data.selectedIncrementalRun.batch_count }}</strong></div><div><small>发送 / 失败 / 跳过</small><strong>{{ data.selectedIncrementalRun.sent_count }} / {{ data.selectedIncrementalRun.failed_count }} / {{ data.selectedIncrementalRun.skipped_count }}</strong></div></div><p v-if="data.selectedIncrementalRun.error_summary" class="error">{{ data.selectedIncrementalRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedIncrementalRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryIncrementalBatch(batch.id)">重新投递</button></article><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedIncrementalRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
           <aside v-if="data.selectedDelivery" class="detail-overlay" @click.self="data.selectedDelivery=null"><section class="detail-panel"><button class="close" @click="data.selectedDelivery=null">×</button><p class="eyebrow">EMAIL DELIVERY</p><h2>{{ data.selectedDelivery.task_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDelivery.status }}</strong></div><div><small>收件人</small><strong>{{ data.selectedDelivery.recipient }}</strong></div><div><small>创建时间</small><strong>{{ formatBeijing(data.selectedDelivery.created_at) }}</strong></div><div><small>发送时间</small><strong>{{ formatBeijing(data.selectedDelivery.sent_at) }}</strong></div></div><p v-if="data.selectedDelivery.last_error" class="error">{{ data.selectedDelivery.last_error }}</p><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedDelivery.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article><button v-if="user.role==='admin' && data.selectedDelivery.status==='failed'" class="primary" @click="retryDelivery(data.selectedDelivery.id)">重新投递</button></section></aside>
       </section>
     </div>

@@ -33,6 +33,13 @@ def main() -> int:
         digest_rules.raise_for_status()
         digest_runs = client.get("/api/v1/notifications/digests/runs?page_size=1")
         digest_runs.raise_for_status()
+        incremental_config = client.get("/api/v1/notifications/incremental/config")
+        incremental_config.raise_for_status()
+        incremental_payload = incremental_config.json()["config"]
+        assert incremental_payload["timezone"] == "Asia/Shanghai"
+        assert incremental_payload["default_send_times"]
+        incremental_runs = client.get("/api/v1/notifications/incremental/runs?page_size=1")
+        incremental_runs.raise_for_status()
         print("SMOKE_OK", ready.json()["status"], dashboard.json()["counts"])
     return 0
 
