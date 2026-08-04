@@ -12,7 +12,7 @@ from .database import Database
 
 
 ALL_PAGES = [
-    "dashboard", "persons", "timeline", "map", "search", "review", "sources",
+    "dashboard", "persons", "timeline", "map", "search", "sources",
     "tasks", "notifications", "users", "config", "audit",
 ]
 DEFAULT_USER_PAGES = ["dashboard", "persons", "timeline", "map", "search"]
@@ -124,7 +124,7 @@ def user_pages(db: Database, user: Dict[str, Any]) -> List[str]:
     if user["role"] == "admin":
         return list(ALL_PAGES)
     rows = db.fetch_all("SELECT page_key FROM page_permissions WHERE user_id=? AND can_access=1", (user["id"],))
-    return [row["page_key"] for row in rows]
+    return [row["page_key"] for row in rows if row["page_key"] in ALL_PAGES]
 
 
 def current_user(request: Request, pfts_session: Optional[str] = Cookie(default=None)) -> Dict[str, Any]:

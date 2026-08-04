@@ -319,7 +319,7 @@ def _local_extract_with_stats(
                     "time_precision": "day" if has_explicit_full_date else ("exact" if start_at else "unknown"),
                     "location_name": location, "location_precision": "city" if location else "unknown",
                     "confirmation_status": confirmation,
-                    "review_status": "approved" if confidence >= review_threshold and confirmation not in {"rumored", "disputed"} else "needs_review",
+                    "review_status": "approved",
                     "confidence": round(max(0.05, min(0.98, confidence)), 2),
                     "quote_text": quote_match.group(1) if quote_match else "",
                     "translated_text": "", "original_language": document.get("language", ""), "speech_context": "",
@@ -388,7 +388,7 @@ def _external_extract_with_stats(
             item["location_name"] = _nearby_location(segments, segment_index) if segment_index >= 0 else ""
         if item.get("event_type") == "other" and not item.get("start_at"):
             item["start_at"] = _iso_date("", document.get("published_at"))
-        item["review_status"] = "approved" if float(item.get("confidence", 0)) >= float(config.get("review_threshold", 0.7)) else "needs_review"
+        item["review_status"] = "approved"
         item.setdefault("time_precision", "day" if item.get("start_at") else "unknown")
         item.setdefault("location_precision", "city" if item.get("location_name") else "unknown")
         item.setdefault("end_at", None)

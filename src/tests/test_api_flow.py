@@ -15,7 +15,7 @@ def test_health_auth_and_permissions(client):
     assert client.post("/api/v1/auth/logout").status_code == 200
 
 
-def test_complete_manual_document_to_review_flow(admin_client):
+def test_complete_manual_document_to_timeline_delete_flow(admin_client):
     person = admin_client.post("/api/v1/persons", json={
         "name": "黄仁勋", "native_name": "Jensen Huang", "bio": "", "organization": "NVIDIA",
         "title": "CEO", "country_region": "美国", "language": "zh-CN", "avatar_path": "",
@@ -50,27 +50,35 @@ def test_complete_manual_document_to_review_flow(admin_client):
     detail = admin_client.get("/api/v1/events/{}".format(first["id"]))
     assert detail.status_code == 200
     assert detail.json()["evidence"][0]["canonical_url"] == "https://example.com/public/1"
+    assert {item["review_status"] for item in events.json()["items"]} == {"approved"}
 
-    reviewed = admin_client.post("/api/v1/events/{}/review".format(first["id"]), json={
+    removed_review = admin_client.post("/api/v1/events/{}/review".format(first["id"]), json={
         "action": "approve", "reason": "证据与原文一致"
     })
-    assert reviewed.status_code == 200
-    assert reviewed.json()["review_status"] == "approved"
+    assert removed_review.status_code == 410
 
     second_id = next(item["id"] for item in events.json()["items"] if item["id"] != first["id"])
-    rejected = admin_client.post("/api/v1/events/{}/review".format(second_id), json={"action": "reject", "reason": "测试驳回"})
-    assert rejected.status_code == 200
+    admin_client.post("/api/v1/auth/logout")
+    assert admin_client.post("/api/v1/auth/login", json={"username": "analyst", "password": "reader123"}).status_code == 200
+    denied = admin_client.delete("/api/v1/events/{}".format(second_id))
+    assert denied.status_code == 403
+    admin_client.post("/api/v1/auth/logout")
+    assert admin_client.post("/api/v1/auth/login", json={"username": "admin", "password": "admin123"}).status_code == 200
+
+    deleted = admin_client.delete("/api/v1/events/{}".format(second_id))
+    assert deleted.status_code == 200
     assert admin_client.get("/api/v1/events").json()["total"] == 1
-    rejected_list = admin_client.get("/api/v1/events", params={"review_status": "rejected"}).json()
-    assert rejected_list["total"] == 1
-    assert rejected_list["items"][0]["id"] == second_id
-    assert reviewed.json()["human_locked"] == 1
-    assert reviewed.json()["history"][0]["reason"] == "证据与原文一致"
+    assert admin_client.get("/api/v1/events/{}".format(second_id)).status_code == 404
+    assert any(
+        item["action"] == "delete" and item["object_type"] == "event"
+        for item in admin_client.get("/api/v1/audit-logs").json()["items"]
+    )
 
     dashboard = admin_client.get("/api/v1/dashboard/summary").json()
     assert dashboard["counts"]["persons"] == 1
     assert dashboard["counts"]["sources"] == 1
     assert dashboard["counts"]["events_today"] == 1
+    assert "needs_review" not in dashboard["counts"]
 
     task = admin_client.get("/api/v1/tasks").json()["items"][0]
     run = admin_client.post("/api/v1/tasks/{}/run".format(task["id"]))
@@ -154,7 +162,10 @@ def test_config_masking_and_user_permissions(admin_client):
     assert payload["ai"]["api_key_env"]["environment_variable"] == "PFTS_AI_API_KEY"
 
     users = admin_client.get("/api/v1/users").json()
+    assert "review" not in users["all_pages"]
     analyst = next(user for user in users["items"] if user["username"] == "analyst")
+    changed = admin_client.put("/api/v1/users/{}/permissions".format(analyst["id"]), json={"pages": ["dashboard", "timeline", "review"]})
+    assert changed.status_code == 422
     changed = admin_client.put("/api/v1/users/{}/permissions".format(analyst["id"]), json={"pages": ["dashboard", "timeline"]})
     assert changed.status_code == 200
     assert changed.json()["pages"] == ["dashboard", "timeline"]

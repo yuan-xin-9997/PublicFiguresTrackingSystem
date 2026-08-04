@@ -124,16 +124,6 @@ class TaskBody(BaseModel):
     enabled: bool = True
 
 
-class ReviewBody(BaseModel):
-    action: str
-    reason: str = Field(default="", max_length=2000)
-    title: Optional[str] = Field(default=None, max_length=500)
-    summary: Optional[str] = Field(default=None, max_length=2000)
-    confirmation_status: Optional[str] = None
-    start_at: Optional[str] = None
-    location_name: Optional[str] = Field(default=None, max_length=300)
-
-
 class PermissionBody(BaseModel):
     pages: List[str]
 
@@ -371,7 +361,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 "sources": count("SELECT COUNT(*) n FROM information_sources WHERE enabled=1"),
                 "documents_today": count("SELECT COUNT(*) n FROM raw_documents WHERE substr(collected_at,1,10)=substr(?,1,10)", (utc_now(),)),
                 "events_today": count("SELECT COUNT(*) n FROM timeline_events WHERE review_status!='rejected' AND substr(created_at,1,10)=substr(?,1,10)", (utc_now(),)),
-                "needs_review": count("SELECT COUNT(*) n FROM timeline_events WHERE review_status IN ('pending','needs_review')"),
                 "failed_tasks": count("SELECT COUNT(*) n FROM task_runs WHERE status IN ('failed','partial_success')"),
             }, "recent_events": recent, "failed_runs": failed,
         }
@@ -391,7 +380,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             where += " AND (p.name LIKE ? OR p.native_name LIKE ? OR p.organization LIKE ? OR EXISTS(SELECT 1 FROM person_aliases a WHERE a.person_id=p.id AND a.alias LIKE ?))"
             params.extend(["%" + q + "%"] * 4)
         items = db.fetch_all(
-            "SELECT p.*,(SELECT COUNT(*) FROM timeline_events e WHERE e.person_id=p.id) event_count FROM public_figures p " + where + " ORDER BY p.enabled DESC,p.name", params
+            "SELECT p.*,(SELECT COUNT(*) FROM timeline_events e WHERE e.person_id=p.id AND e.review_status!='rejected') event_count FROM public_figures p " + where + " ORDER BY p.enabled DESC,p.name", params
         )
         for item in items:
             item["aliases"] = [row["alias"] for row in db.fetch_all("SELECT alias FROM person_aliases WHERE person_id=? AND enabled=1", (item["id"],))]
@@ -660,12 +649,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             "SELECT 1 FROM event_evidence oe JOIN event_evidence same_doc ON same_doc.document_id=oe.document_id "
             "JOIN timeline_events preferred ON preferred.id=same_doc.event_id "
             "WHERE oe.event_id=e.id AND preferred.person_id=e.person_id AND preferred.event_type='statement' "
-            "AND preferred.review_status!='rejected'))"
+            "AND preferred.review_status!='rejected'))",
+            "e.review_status!='rejected'",
         ]
         params: List[Any] = []
-        if not review_status:
-            clauses.append("e.review_status!='rejected'")
-        for field, value in (("e.person_id", person_id), ("e.event_type", event_type), ("e.confirmation_status", confirmation_status), ("e.review_status", review_status)):
+        for field, value in (("e.person_id", person_id), ("e.event_type", event_type), ("e.confirmation_status", confirmation_status)):
             if value not in (None, ""):
                 clauses.append(field + "=?")
                 params.append(value)
@@ -705,43 +693,34 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @application.get("/api/v1/events/{event_id}")
     def get_event(event_id: int, user: Dict[str, Any] = Depends(require_page("timeline"))):
         item = event_detail(db, event_id)
-        if not item:
+        if not item or item.get("review_status") == "rejected":
             raise HTTPException(404, "事件不存在")
         return item
 
-    @application.post("/api/v1/events/{event_id}/review")
-    def review_event(event_id: int, body: ReviewBody, request: Request, user: Dict[str, Any] = Depends(require_admin)):
-        before = event_detail(db, event_id)
-        if not before:
+    @application.post("/api/v1/events/{event_id}/review", status_code=status.HTTP_410_GONE)
+    def review_event_removed(event_id: int, user: Dict[str, Any] = Depends(require_admin)):
+        raise HTTPException(status.HTTP_410_GONE, "事件审核流程已移除，请在时间线中删除不需要保留的事件")
+
+    @application.delete("/api/v1/events/{event_id}")
+    def delete_event(event_id: int, request: Request, user: Dict[str, Any] = Depends(require_admin)):
+        event = event_detail(db, event_id)
+        if not event or event.get("review_status") == "rejected":
             raise HTTPException(404, "事件不存在")
-        action_status = {"approve": "approved", "reject": "rejected", "needs_review": "needs_review"}
-        if body.action not in action_status:
-            raise HTTPException(422, "不支持的审核动作")
-        updates = {"review_status": action_status[body.action], "human_locked": 1, "updated_at": utc_now()}
-        for field in ("title", "summary", "confirmation_status", "start_at", "location_name"):
-            value = getattr(body, field)
-            if value is not None:
-                updates[field] = value
-        allowed_confirm = {"rumored", "expected", "confirmed", "ongoing", "completed", "cancelled", "disputed"}
-        if "confirmation_status" in updates and updates["confirmation_status"] not in allowed_confirm:
-            raise HTTPException(422, "确认状态无效")
-        assignments = ",".join(key + "=?" for key in updates)
-        values = list(updates.values()) + [event_id]
+        summary = "删除事件：{} / {} / {}".format(
+            event.get("person_name") or "", event.get("event_type") or "", event.get("title") or ""
+        )[:1000]
         with db.transaction() as connection:
-            connection.execute("UPDATE timeline_events SET " + assignments + " WHERE id=?", values)
-            connection.execute(
-                "INSERT INTO event_history(event_id,action,before_json,after_json,operator_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
-                (event_id, body.action, json_text({k: before.get(k) for k in updates}), json_text(updates), user["id"], body.reason, utc_now()),
-            )
-        audit(db, "review:" + body.action, "event", event_id, user["id"], ip_address=_client_ip(request), summary=body.reason)
-        return event_detail(db, event_id)
+            connection.execute("DELETE FROM timeline_events WHERE id=?", (event_id,))
+        audit(db, "delete", "event", event_id, user["id"], ip_address=_client_ip(request), summary=summary)
+        return {"ok": True, "id": event_id}
 
     @application.get("/api/v1/search")
     def search(q: str = Query(min_length=1, max_length=200), page_size: int = Query(30, ge=1, le=100), user: Dict[str, Any] = Depends(require_page("search"))):
         term = "%" + q + "%"
         events = db.fetch_all(
             "SELECT e.id,'event' result_type,e.title,e.summary,e.start_at,p.name AS person_name FROM timeline_events e "
-            "JOIN public_figures p ON p.id=e.person_id WHERE e.title LIKE ? OR e.summary LIKE ? OR e.quote_text LIKE ? OR e.location_name LIKE ? OR p.name LIKE ? LIMIT ?",
+            "JOIN public_figures p ON p.id=e.person_id WHERE e.review_status!='rejected' "
+            "AND (e.title LIKE ? OR e.summary LIKE ? OR e.quote_text LIKE ? OR e.location_name LIKE ? OR p.name LIKE ?) LIMIT ?",
             (term, term, term, term, term, page_size),
         )
         remaining = max(0, page_size - len(events))

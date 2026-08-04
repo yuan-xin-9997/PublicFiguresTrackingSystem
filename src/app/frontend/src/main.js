@@ -42,7 +42,7 @@ const App = {
       selectedIncrementalRun: null
     })
     const filters = reactive({
-      q: '', person_id: '', event_type: '', confirmation_status: '', review_status: '',
+      q: '', person_id: '', event_type: '', confirmation_status: '',
       start_date: '', end_date: '', sort_order: 'desc', location: []
     })
     const loginForm = reactive({ username: 'admin', password: '' })
@@ -86,7 +86,7 @@ const App = {
 
     const nav = [
       ['dashboard', '总览'], ['timeline', '时间线'], ['persons', '人物'], ['map', '地图'], ['search', '搜索'],
-      ['review', '审核中心'], ['sources', '信息源'], ['tasks', '任务中心'], ['notifications', '推送管理'], ['users', '用户权限'],
+      ['sources', '信息源'], ['tasks', '任务中心'], ['notifications', '推送管理'], ['users', '用户权限'],
       ['config', '系统配置'], ['audit', '审计日志']
     ]
     const visibleNav = computed(() => nav.filter(([key]) => user.value?.pages?.includes(key)))
@@ -159,11 +159,10 @@ const App = {
       if (!user.value) return
       await perform(async () => {
         if (active.value === 'dashboard') data.dashboard = await api('/dashboard/summary')
-        else if (['timeline', 'review', 'map'].includes(active.value)) {
+        else if (['timeline', 'map'].includes(active.value)) {
           if (!data.persons.length && user.value.pages.includes('persons')) data.persons = (await api('/persons')).items
           if (active.value === 'timeline' && !data.locations.length) data.locations = (await api('/events/locations')).items
           const params = active.value === 'map' ? { page_size: 100, event_type: 'itinerary', person_id: mapPersonId.value } : { page_size: 100, ...filters }
-          if (active.value === 'review') params.review_status = 'needs_review'
           const result = await api(`/events?${queryString(params)}`)
           data.events = result.items; data.eventTotal = result.total
         } else if (active.value === 'persons') data.persons = (await api(`/persons?${queryString({ q: filters.q })}`)).items
@@ -257,6 +256,17 @@ const App = {
 
     async function openEvent(id) {
       await perform(async () => { data.selectedEvent = await api(`/events/${id}`) }).catch(() => {})
+    }
+
+    async function deleteEvent(event) {
+      if (!window.confirm(`确定删除事件“${event.title}”吗？该事件会从时间线、地图、搜索和后续推送中移除。`)) return
+      await perform(async () => {
+        await api(`/events/${event.id}`, { method: 'DELETE' })
+        if (data.selectedEvent?.id === event.id) data.selectedEvent = null
+        flash('事件已删除')
+        await loadPage()
+        if (active.value === 'map') await renderMap()
+      }).catch(() => {})
     }
 
     function resetPersonForm() {
@@ -683,15 +693,6 @@ const App = {
       }).catch(() => {})
     }
 
-    async function review(id, action) {
-      const reason = window.prompt(action === 'approve' ? '审核说明（可选）' : '请填写驳回原因', '')
-      if (reason === null) return
-      await perform(async () => {
-        await api(`/events/${id}/review`, { method: 'POST', body: JSON.stringify({ action, reason }) })
-        flash('审核结果已保存'); data.selectedEvent = null; await loadPage()
-      }).catch(() => {})
-    }
-
     async function savePermissions(target) {
       await perform(async () => {
         await api(`/users/${target.id}/permissions`, { method: 'PUT', body: JSON.stringify({ pages: target.pages }) })
@@ -701,7 +702,7 @@ const App = {
 
     async function searchNow() { active.value = 'search'; await loadPage() }
 
-    watch(() => [filters.person_id, filters.event_type, filters.confirmation_status, filters.review_status, filters.start_date, filters.end_date, filters.sort_order, filters.location.join('|')], () => {
+    watch(() => [filters.person_id, filters.event_type, filters.confirmation_status, filters.start_date, filters.end_date, filters.sort_order, filters.location.join('|')], () => {
       if (['timeline', 'map'].includes(active.value)) loadPage()
     })
     onMounted(checkSession)
@@ -710,10 +711,10 @@ const App = {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
       maintenance, emailForm, ruleForm, editingRuleId, rulePersonSearch, visibleRulePersons, deliveryFilters, incrementalRunFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
       digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestPreviewDate, digestRunFilters,
-      login, logout, loadPage, selectPage, openEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
+      login, logout, loadPage, selectPage, openEvent, deleteEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
       runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail, saveNotificationRule, editRule, resetRuleForm, selectAllRuleTasks, clearRuleTasks, selectAllRulePersons, clearRulePersons, addRuleSendTime, removeRuleSendTime, toggleRule, removeRule, previewIncrementalRule, runIncrementalRule, openIncrementalRun, retryIncrementalBatch,
       saveDigestRule, editDigestRule, resetDigestForm, selectAllDigestPersons, clearDigestPersons, previewDigestRule, toggleDigestRule, removeDigestRule, runDigestRule, openDigestRun, retryDigestBatch,
-      openDelivery, retryDelivery, review, savePermissions, searchNow
+      openDelivery, retryDelivery, savePermissions, searchNow
     }
   },
   template: `
@@ -746,7 +747,7 @@ const App = {
 
         <template v-if="active === 'dashboard' && data.dashboard">
           <div class="metric-grid">
-            <article v-for="(value,key) in data.dashboard.counts" :key="key" class="metric"><span>{{ {persons:'跟踪人物',sources:'启用来源',documents_today:'今日材料',events_today:'今日事件',needs_review:'待审核',failed_tasks:'异常任务'}[key] }}</span><strong>{{ value }}</strong></article>
+            <article v-for="(value,key) in data.dashboard.counts" :key="key" class="metric"><span>{{ {persons:'跟踪人物',sources:'启用来源',documents_today:'今日材料',events_today:'今日事件',failed_tasks:'异常任务'}[key] }}</span><strong>{{ value }}</strong></article>
           </div>
           <div class="two-column">
             <section class="panel"><div class="section-title"><h3>最新事件</h3><button @click="selectPage('timeline')">查看全部</button></div><div class="event-list"><button class="event-row" v-for="event in data.dashboard.recent_events" :key="event.id" @click="openEvent(event.id)"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><div><strong>{{ event.title }}</strong><small>{{ event.person_name }} · {{ formatBeijing(event.start_at) }}</small></div><span class="status">{{ statusLabels[event.confirmation_status] }}</span></button><p v-if="!data.dashboard.recent_events.length" class="empty">还没有事件，先创建人物和人工来源。</p></div></section>
@@ -754,13 +755,12 @@ const App = {
           </div>
         </template>
 
-        <template v-if="['timeline','review'].includes(active)">
+        <template v-if="active === 'timeline'">
           <div :class="['toolbar', { 'timeline-toolbar': active === 'timeline' }]">
             <input v-model="filters.q" @keyup.enter="loadPage" placeholder="搜索标题、地点或言论" />
             <select v-model="filters.person_id"><option value="">全部人物</option><option v-for="p in data.persons" :value="p.id">{{ p.name }}</option></select>
             <select v-model="filters.event_type"><option value="">全部类型</option><option value="itinerary">行程</option><option value="statement">言论</option><option value="other">其他</option></select>
             <select v-if="active==='timeline'" v-model="filters.confirmation_status"><option value="">全部发生状态</option><option v-for="s in ['rumored','expected','confirmed','ongoing','completed','cancelled','disputed']" :value="s">{{ statusLabels[s] }}</option></select>
-            <select v-if="active==='timeline'" v-model="filters.review_status"><option value="">全部审核状态</option><option v-for="s in ['pending','needs_review','approved','rejected']" :value="s">{{ statusLabels[s] }}</option></select>
             <input v-if="active==='timeline'" v-model="filters.start_date" type="date" title="开始日期" />
             <input v-if="active==='timeline'" v-model="filters.end_date" type="date" title="结束日期" />
             <select v-if="active==='timeline'" v-model="filters.sort_order"><option value="desc">时间降序（新到旧）</option><option value="asc">时间升序（旧到新）</option></select>
@@ -787,7 +787,7 @@ const App = {
           <div class="timeline">
             <article v-for="event in data.events" :key="event.id" :class="['timeline-card', event.event_type]" @click="openEvent(event.id)">
               <div class="timeline-date"><strong>{{ formatBeijing(event.start_at).split(' ')[0] }}</strong><span>{{ event.time_precision === 'unknown' ? '时间未知' : '北京时间' }}</span></div>
-              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span class="status">{{ statusLabels[event.review_status] }}</span><span>可信度 {{ percent(event.confidence) }}</span><span>{{ event.source_names || '来源未知' }}</span></footer></div>
+              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span>可信度 {{ percent(event.confidence) }}</span><span>{{ event.source_names || '来源未知' }}</span><button v-if="user.role==='admin'" class="delete-link small" @click.stop="deleteEvent(event)">删除</button></footer></div>
             </article>
             <p v-if="!data.events.length" class="empty">这个筛选条件下还没有事件。</p>
           </div>
@@ -1026,7 +1026,7 @@ const App = {
         <template v-if="active === 'config'"><section class="panel"><div class="section-title"><h3>当前生效配置</h3><span>敏感字段已脱敏</span></div><pre>{{ JSON.stringify(data.config, null, 2) }}</pre></section></template>
         <template v-if="active === 'audit'"><section class="panel"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>结果</th><th>摘要</th></tr></thead><tbody><tr v-for="item in data.audit" :key="item.id"><td>{{ formatBeijing(item.created_at) }}</td><td>{{ item.username || '系统/未知' }}</td><td>{{ item.action }}</td><td>{{ item.object_type }} #{{ item.object_id }}</td><td>{{ item.result }}</td><td>{{ item.change_summary }}</td></tr></tbody></table></section></template>
 
-          <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="primary" @click="review(data.selectedEvent.id,'approve')">通过审核</button><button class="danger" @click="review(data.selectedEvent.id,'reject')">驳回</button></div></section></aside>
+          <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="danger" @click="deleteEvent(data.selectedEvent)">删除事件</button></div></section></aside>
           <aside v-if="data.selectedDigestRun" class="detail-overlay" @click.self="data.selectedDigestRun=null"><section class="detail-panel"><button class="close" @click="data.selectedDigestRun=null">×</button><p class="eyebrow">DAILY TIMELINE DIGEST</p><h2>{{ data.selectedDigestRun.rule_name }} · {{ data.selectedDigestRun.scheduled_date }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDigestRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedDigestRun.trigger_type==='manual' ? '手工补跑' : '自动调度' }}</strong></div><div><small>窗口开始</small><strong>{{ formatBeijing(data.selectedDigestRun.window_start) }}</strong></div><div><small>窗口结束</small><strong>{{ formatBeijing(data.selectedDigestRun.window_end) }}</strong></div></div><p v-if="data.selectedDigestRun.error_summary" class="error">{{ data.selectedDigestRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedDigestRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryDigestBatch(batch.id)">重新投递</button></article><h3>时间线明细</h3><article class="evidence" v-for="item in data.selectedDigestRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
           <aside v-if="data.selectedIncrementalRun" class="detail-overlay" @click.self="data.selectedIncrementalRun=null"><section class="detail-panel"><button class="close" aria-label="关闭" @click="data.selectedIncrementalRun=null">×</button><p class="eyebrow">SCHEDULED INCREMENTAL PUSH</p><h2>{{ data.selectedIncrementalRun.rule_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedIncrementalRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedIncrementalRun.trigger_type==='manual' ? '立即汇总' : '自动调度' }}</strong></div><div><small>入库窗口开始</small><strong>{{ formatBeijing(data.selectedIncrementalRun.lower_created_at) }}</strong></div><div><small>入库窗口结束</small><strong>{{ formatBeijing(data.selectedIncrementalRun.upper_created_at) }}</strong></div><div><small>候选 / 批次</small><strong>{{ data.selectedIncrementalRun.candidate_count }} / {{ data.selectedIncrementalRun.batch_count }}</strong></div><div><small>发送 / 失败 / 跳过</small><strong>{{ data.selectedIncrementalRun.sent_count }} / {{ data.selectedIncrementalRun.failed_count }} / {{ data.selectedIncrementalRun.skipped_count }}</strong></div></div><p v-if="data.selectedIncrementalRun.error_summary" class="error">{{ data.selectedIncrementalRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedIncrementalRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryIncrementalBatch(batch.id)">重新投递</button></article><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedIncrementalRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
           <aside v-if="data.selectedDelivery" class="detail-overlay" @click.self="data.selectedDelivery=null"><section class="detail-panel"><button class="close" @click="data.selectedDelivery=null">×</button><p class="eyebrow">EMAIL DELIVERY</p><h2>{{ data.selectedDelivery.task_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDelivery.status }}</strong></div><div><small>收件人</small><strong>{{ data.selectedDelivery.recipient }}</strong></div><div><small>创建时间</small><strong>{{ formatBeijing(data.selectedDelivery.created_at) }}</strong></div><div><small>发送时间</small><strong>{{ formatBeijing(data.selectedDelivery.sent_at) }}</strong></div></div><p v-if="data.selectedDelivery.last_error" class="error">{{ data.selectedDelivery.last_error }}</p><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedDelivery.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article><button v-if="user.role==='admin' && data.selectedDelivery.status==='failed'" class="primary" @click="retryDelivery(data.selectedDelivery.id)">重新投递</button></section></aside>

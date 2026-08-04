@@ -117,7 +117,7 @@ def test_incremental_migration_upgrades_legacy_rules_and_indexes(tmp_path):
     rule = db.fetch_one("SELECT * FROM notification_rules WHERE name='旧规则'")
     assert rule["delivery_mode"] == "immediate"
     assert json.loads(rule["send_times_json"]) == []
-    assert db.fetch_one("SELECT MAX(version) version FROM schema_version")["version"] == 7
+    assert db.fetch_one("SELECT MAX(version) version FROM schema_version")["version"] == 8
     indexes = {row["name"] for row in db.fetch_all(
         "SELECT name FROM sqlite_master WHERE type='index'"
     )}

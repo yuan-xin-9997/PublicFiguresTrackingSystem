@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS timeline_events (
     longitude REAL,
     location_precision TEXT NOT NULL DEFAULT 'unknown',
     confirmation_status TEXT NOT NULL DEFAULT 'rumored',
-    review_status TEXT NOT NULL DEFAULT 'pending',
+    review_status TEXT NOT NULL DEFAULT 'approved',
     confidence REAL NOT NULL DEFAULT 0.5,
     quote_text TEXT NOT NULL DEFAULT '',
     translated_text TEXT NOT NULL DEFAULT '',
@@ -488,7 +488,7 @@ class Database:
                         original_timezone TEXT NOT NULL DEFAULT '', time_precision TEXT NOT NULL DEFAULT 'unknown',
                         location_name TEXT NOT NULL DEFAULT '', latitude REAL, longitude REAL,
                         location_precision TEXT NOT NULL DEFAULT 'unknown', confirmation_status TEXT NOT NULL DEFAULT 'rumored',
-                        review_status TEXT NOT NULL DEFAULT 'pending', confidence REAL NOT NULL DEFAULT 0.5,
+                        review_status TEXT NOT NULL DEFAULT 'approved', confidence REAL NOT NULL DEFAULT 0.5,
                         quote_text TEXT NOT NULL DEFAULT '', translated_text TEXT NOT NULL DEFAULT '',
                         original_language TEXT NOT NULL DEFAULT '', speech_context TEXT NOT NULL DEFAULT '',
                         dedup_key TEXT NOT NULL, human_locked INTEGER NOT NULL DEFAULT 0,
@@ -611,6 +611,17 @@ class Database:
                 """)
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(7, datetime('now'))"
+                )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=8").fetchone():
+                connection.execute(
+                    "UPDATE timeline_events SET review_status='approved',updated_at=datetime('now') "
+                    "WHERE review_status IN ('pending','needs_review')"
+                )
+                connection.execute(
+                    "DELETE FROM page_permissions WHERE page_key='review'"
+                )
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(8, datetime('now'))"
                 )
 
     @contextmanager

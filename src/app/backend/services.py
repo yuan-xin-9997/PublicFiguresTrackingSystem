@@ -195,7 +195,7 @@ def analyze_document(
                         normalize_datetime(event.get("start_at")), normalize_datetime(event.get("end_at")),
                         event.get("original_timezone", "")[:50], event.get("time_precision", "unknown"),
                         event.get("location_name", "")[:300], event.get("location_precision", "unknown"),
-                        event.get("confirmation_status", "rumored"), event.get("review_status", "needs_review"),
+                        event.get("confirmation_status", "rumored"), "approved",
                         float(event.get("confidence", 0.5)), event.get("quote_text", "")[:2000],
                         event.get("translated_text", "")[:2000], event.get("original_language", "")[:30],
                         event.get("speech_context", "")[:500], event["dedup_key"], now, now,
