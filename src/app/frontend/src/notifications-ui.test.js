@@ -11,32 +11,25 @@ describe('email notification management UI', () => {
     expect(source).toContain("user.role==='admin'")
   })
 
-  it('supports effective config, rules, test sending and delivery retry', () => {
+  it('supports effective config, test sending and delivery retry', () => {
     expect(source).toContain('/notifications/email/config')
     expect(source).toContain('/notifications/email/test')
-    expect(source).toContain('/notifications/rules')
+    expect(source).toContain('/notifications/digests/rules')
     expect(source).toContain('/notifications/deliveries/')
     expect(source).toContain('retryDelivery')
     expect(source).toContain('formatBeijing(delivery.created_at)')
   })
 
-  it('uses explicit task checkboxes instead of a modifier-key multi-select', () => {
-    expect(source).toContain('class="task-picker span-two"')
-    expect(source).toContain('v-model="ruleForm.task_ids" type="checkbox"')
-    expect(source).toContain('@click="selectAllRuleTasks"')
-    expect(source).toContain('@click="clearRuleTasks"')
-    expect(source).not.toContain('v-model="ruleForm.task_ids" multiple')
-    expect(styles).toContain('.task-option-grid')
-  })
-
-  it('supports searchable optional person selection with all-person compatibility', () => {
-    expect(source).toContain('v-model="ruleForm.person_ids" type="checkbox"')
-    expect(source).toContain('v-model="rulePersonSearch"')
-    expect(source).toContain('@click="selectAllRulePersons"')
-    expect(source).toContain('@click="clearRulePersons"')
-    expect(source).toContain('未选择人物时匹配全部人物')
-    expect(source).toContain("'全部人物'")
-    expect(styles).toContain('.person-option-grid')
+  it('no longer renders the retired push-rule and scheduled-incremental modules', () => {
+    expect(source).not.toContain('/notifications/rules')
+    expect(source).not.toContain('/notifications/incremental')
+    expect(source).not.toContain('新增推送规则')
+    expect(source).not.toContain('推送规则</h3>')
+    expect(source).not.toContain('定时增量运行')
+    expect(source).not.toContain('selectedIncrementalRun')
+    expect(source).not.toContain('saveNotificationRule')
+    expect(source).not.toContain('ruleForm')
+    expect(source).not.toContain('incrementalRunFilters')
   })
 
   it('provides responsive notification layout and status feedback', () => {

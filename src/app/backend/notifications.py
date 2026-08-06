@@ -19,13 +19,6 @@ from cryptography.fernet import Fernet, InvalidToken
 from .config import Settings
 from .daily_digest import build_digest_message, refresh_digest_run_status
 from .database import Database, json_text
-from .scheduled_incremental import (
-    build_incremental_message,
-    delete_notification_rule,
-    list_notification_rules,
-    refresh_incremental_run_status,
-    save_notification_rule,
-)
 from .security import utc_now
 
 
@@ -227,126 +220,6 @@ def validate_sendable(config: Dict[str, Any], require_enabled: bool = True) -> N
         raise ValueError("邮件配置不完整：{}".format(", ".join(missing)))
 
 
-def list_rules(db: Database) -> List[Dict[str, Any]]:
-    return list_notification_rules(db)
-
-
-def save_rule(
-    db: Database,
-    name: str,
-    task_ids: Iterable[int],
-    event_types: Iterable[str],
-    enabled: bool,
-    rule_id: Optional[int] = None,
-    person_ids: Optional[Iterable[int]] = None,
-    delivery_mode: str = "immediate",
-    send_times: Optional[Sequence[str]] = None,
-    settings: Optional[Settings] = None,
-) -> Dict[str, Any]:
-    return save_notification_rule(
-        db, name, task_ids, event_types, enabled, rule_id=rule_id,
-        person_ids=person_ids, delivery_mode=delivery_mode,
-        send_times=send_times, settings=settings,
-    )
-
-
-def delete_rule(db: Database, rule_id: int) -> bool:
-    return delete_notification_rule(db, rule_id)
-
-
-def _chunks(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
-    for offset in range(0, len(values), size):
-        yield values[offset:offset + size]
-
-
-def enqueue_task_run(db: Database, settings: Settings, run_id: int) -> Dict[str, int]:
-    config, _ = effective_email_config(settings, db)
-    counters = {"candidates": 0, "enqueued": 0, "skipped": 0, "batches": 0}
-    if not config.get("enabled") or not config.get("to_addresses"):
-        return counters
-    run = db.fetch_one("SELECT id,task_id FROM task_runs WHERE id=?", (run_id,))
-    if not run:
-        raise ValueError("任务运行不存在")
-    rule_rows = db.fetch_all(
-        "SELECT r.id,r.event_types_json FROM notification_rules r "
-        "JOIN notification_rule_tasks rt ON rt.rule_id=r.id "
-        "WHERE r.enabled=1 AND r.delivery_mode='immediate' AND r.deleted_at IS NULL "
-        "AND rt.task_id=?",
-        (run["task_id"],),
-    )
-    matchers = []
-    for row in rule_rows:
-        try:
-            allowed_types = {
-                value for value in json.loads(row["event_types_json"]) if value in EVENT_TYPES
-            }
-        except (TypeError, ValueError):
-            continue
-        if not allowed_types:
-            continue
-        persons = {
-            int(item["person_id"]) for item in db.fetch_all(
-                "SELECT person_id FROM notification_rule_persons WHERE rule_id=?",
-                (row["id"],),
-            )
-        }
-        matchers.append((allowed_types, persons))
-    if not matchers:
-        return counters
-    events = db.fetch_all(
-        "SELECT tre.event_id,e.event_type,e.person_id FROM task_run_events tre "
-        "JOIN timeline_events e ON e.id=tre.event_id "
-        "JOIN public_figures p ON p.id=e.person_id "
-        "WHERE tre.run_id=? AND p.enabled=1 AND p.deleted_at IS NULL ORDER BY tre.event_id",
-        (run_id,),
-    )
-    event_ids = [
-        int(row["event_id"]) for row in events
-        if any(
-            row["event_type"] in allowed_types
-            and (not person_ids or int(row["person_id"]) in person_ids)
-            for allowed_types, person_ids in matchers
-        )
-    ]
-    counters["candidates"] = len(event_ids)
-    if not event_ids:
-        return counters
-    now = utc_now()
-    size = int(config["max_events_per_message"])
-    with db.transaction() as connection:
-        for recipient in config["to_addresses"]:
-            for part_number, chunk in enumerate(_chunks(event_ids, size), 1):
-                cursor = connection.execute(
-                    "INSERT OR IGNORE INTO email_delivery_batches(task_run_id,recipient,part_number,status,"
-                    "next_attempt_at,message_id,created_at,updated_at) VALUES(?,?,?,'pending',?,'',?,?)",
-                    (run_id, recipient, part_number, now, now, now),
-                )
-                batch = connection.execute(
-                    "SELECT id FROM email_delivery_batches WHERE task_run_id=? AND recipient=? AND part_number=?",
-                    (run_id, recipient, part_number),
-                ).fetchone()
-                batch_id = int(batch["id"])
-                connection.execute(
-                    "UPDATE email_delivery_batches SET message_id=? WHERE id=? AND message_id=''",
-                    ("<pfts-{}@local>".format(batch_id), batch_id),
-                )
-                inserted = 0
-                for event_id in chunk:
-                    item = connection.execute(
-                        "INSERT OR IGNORE INTO email_delivery_items(batch_id,task_run_id,event_id,recipient,created_at) "
-                        "VALUES(?,?,?,?,?)",
-                        (batch_id, run_id, event_id, recipient, now),
-                    )
-                    inserted += max(0, int(item.rowcount))
-                if cursor.rowcount and not inserted:
-                    connection.execute("DELETE FROM email_delivery_batches WHERE id=?", (batch_id,))
-                elif cursor.rowcount:
-                    counters["batches"] += 1
-                counters["enqueued"] += inserted
-    counters["skipped"] = max(0, counters["candidates"] * len(config["to_addresses"]) - counters["enqueued"])
-    return counters
-
-
 def _beijing(value: Optional[str]) -> str:
     if not value:
         return "时间未知"
@@ -493,11 +366,6 @@ class NotificationWorker:
             "WHERE status='sending'",
             (now, now),
         )
-        self.db.execute(
-            "UPDATE scheduled_notification_batches SET status='retrying',"
-            "next_attempt_at=?,updated_at=? WHERE status='sending'",
-            (now, now),
-        )
         self.thread.start()
 
     def stop(self) -> None:
@@ -520,7 +388,6 @@ class NotificationWorker:
     def process_once(self) -> Optional[Dict[str, Any]]:
         processors = (
             self.process_immediate_once,
-            self.process_incremental_once,
             self.process_digest_once,
         )
         for offset in range(len(processors)):
@@ -597,85 +464,6 @@ class NotificationWorker:
             )
             LOGGER.warning("email delivery batch %s failed: %s", batch["id"], safe_error)
             return {"id": batch["id"], "status": status, "error": safe_error}
-
-    def process_incremental_once(self) -> Optional[Dict[str, Any]]:
-        now = utc_now()
-        with self.db.transaction() as connection:
-            batch = connection.execute(
-                "SELECT * FROM scheduled_notification_batches "
-                "WHERE status IN ('pending','retrying') AND next_attempt_at<=? "
-                "ORDER BY id LIMIT 1", (now,),
-            ).fetchone()
-            if not batch:
-                return None
-            batch = dict(batch)
-            changed = connection.execute(
-                "UPDATE scheduled_notification_batches SET status='sending',updated_at=? "
-                "WHERE id=? AND status IN ('pending','retrying')",
-                (now, batch["id"]),
-            )
-            if not changed.rowcount:
-                return None
-        try:
-            config, _ = effective_email_config(self.settings, self.db, include_secret=True)
-            message, deliverable, skipped = build_incremental_message(
-                self.db, self.settings, int(batch["id"]), config
-            )
-            if skipped:
-                placeholders = ",".join("?" for _ in skipped)
-                self.db.execute(
-                    "UPDATE scheduled_notification_items SET status='skipped',"
-                    "skip_reason='事件已删除或被驳回' WHERE id IN ({})".format(placeholders),
-                    skipped,
-                )
-            if message is None:
-                self.db.execute(
-                    "UPDATE scheduled_notification_batches SET status='skipped',updated_at=?,"
-                    "last_error='' WHERE id=?", (utc_now(), batch["id"]),
-                )
-                refresh_incremental_run_status(self.db, int(batch["run_id"]))
-                return {"id": batch["id"], "run_id": batch["run_id"],
-                        "kind": "scheduled_incremental", "status": "skipped"}
-            send_message(config, message)
-            finished = utc_now()
-            with self.db.transaction() as connection:
-                connection.execute(
-                    "UPDATE scheduled_notification_batches SET status='sent',"
-                    "attempt_count=attempt_count+1,sent_at=?,updated_at=?,last_error='' "
-                    "WHERE id=?", (finished, finished, batch["id"]),
-                )
-                if deliverable:
-                    placeholders = ",".join("?" for _ in deliverable)
-                    connection.execute(
-                        "UPDATE scheduled_notification_items SET status='sent' "
-                        "WHERE id IN ({})".format(placeholders), deliverable,
-                    )
-            refresh_incremental_run_status(self.db, int(batch["run_id"]))
-            return {"id": batch["id"], "run_id": batch["run_id"],
-                    "kind": "scheduled_incremental", "status": "sent"}
-        except Exception as exc:
-            safe_error = sanitize_error(exc)
-            config, _ = effective_email_config(self.settings, self.db)
-            attempt = int(batch["attempt_count"]) + 1
-            maximum = int(config.get("max_attempts", 5))
-            status = "failed" if attempt >= maximum else "retrying"
-            delay = int(config.get("retry_base_seconds", 60)) * (2 ** max(0, attempt - 1))
-            next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay)).replace(
-                microsecond=0
-            ).isoformat()
-            self.db.execute(
-                "UPDATE scheduled_notification_batches SET status=?,attempt_count=?,"
-                "next_attempt_at=?,last_error=?,updated_at=? WHERE id=?",
-                (status, attempt, next_attempt, safe_error, utc_now(), batch["id"]),
-            )
-            self.db.execute(
-                "UPDATE scheduled_notification_runs SET error_summary=?,updated_at=? WHERE id=?",
-                (safe_error, utc_now(), batch["run_id"]),
-            )
-            refresh_incremental_run_status(self.db, int(batch["run_id"]))
-            LOGGER.warning("scheduled incremental batch %s failed: %s", batch["id"], safe_error)
-            return {"id": batch["id"], "run_id": batch["run_id"],
-                    "kind": "scheduled_incremental", "status": status, "error": safe_error}
 
     def process_digest_once(self) -> Optional[Dict[str, Any]]:
         now = utc_now()

@@ -297,6 +297,75 @@ def test_digest_message_worker_success_empty_and_retry(configured_app, monkeypat
     )["status"] == "retrying"
 
 
+def test_digest_rule_filters_by_information_source(configured_app):
+    db = configured_app.state.db
+    settings = configured_app.state.settings
+    db.initialize()
+    now = utc_now()
+    person_id = db.execute(
+        "INSERT INTO public_figures(name,created_at,updated_at) VALUES(?,?,?)",
+        ("来源人物", now, now),
+    )
+    source_a = db.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES(?,?,?,?)",
+        ("来源甲", "manual", now, now),
+    )
+    source_b = db.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES(?,?,?,?)",
+        ("来源乙", "manual", now, now),
+    )
+    doc_a = db.execute(
+        "INSERT INTO raw_documents(source_id,title,collected_at,content_text,content_hash) "
+        "VALUES(?,?,?,?,?)", (source_a, "证据甲", now, "材料", "source-a-doc"),
+    )
+    doc_b = db.execute(
+        "INSERT INTO raw_documents(source_id,title,collected_at,content_text,content_hash) "
+        "VALUES(?,?,?,?,?)", (source_b, "证据乙", now, "材料", "source-b-doc"),
+    )
+
+    def event_with_source(title, document_id):
+        event_id = db.execute(
+            "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,"
+            "location_name,confirmation_status,review_status,dedup_key,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,'confirmed','approved',?,?,?)",
+            (person_id, "itinerary", title, "摘要", "2026-07-29T02:00:00+00:00",
+             "北京", "source-" + title, now, now),
+        )
+        db.execute(
+            "INSERT INTO event_evidence(event_id,document_id,evidence_text,evidence_locator) "
+            "VALUES(?,?,?,?)", (event_id, document_id, "证据", "正文"),
+        )
+        return event_id
+
+    event_a = event_with_source("来源甲事件", doc_a)
+    event_b = event_with_source("来源乙事件", doc_b)
+
+    all_rule = save_digest_rule(
+        db, settings, "全量来源", [person_id], ["itinerary"],
+        ["me@example.com"], send_time="08:30", source_ids=[],
+    )
+    db.execute("UPDATE daily_digest_rules SET enabled_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", all_rule["id"]))
+    all_preview = preview_digest(db, settings, all_rule["id"], date(2026, 7, 30))
+    assert all_preview["candidate_count"] == 2
+    assert {item["id"] for item in all_preview["sample"]} == {event_a, event_b}
+
+    filtered_rule = save_digest_rule(
+        db, settings, "仅来源甲", [person_id], ["itinerary"],
+        ["me@example.com"], send_time="08:30", source_ids=[source_a],
+    )
+    assert filtered_rule["source_ids"] == [source_a]
+    db.execute("UPDATE daily_digest_rules SET enabled_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", filtered_rule["id"]))
+    filtered_preview = preview_digest(db, settings, filtered_rule["id"], date(2026, 7, 30))
+    assert filtered_preview["candidate_count"] == 1
+    assert filtered_preview["sample"][0]["id"] == event_a
+
+    with pytest.raises(ValueError, match="不存在或不可用的信息源"):
+        save_digest_rule(
+            db, settings, "非法来源", [person_id], ["itinerary"],
+            ["me@example.com"], send_time="08:30", source_ids=[99999],
+        )
+
+
 def test_digest_scheduler_recovers_only_latest_due_date(configured_app):
     db = configured_app.state.db
     settings = configured_app.state.settings

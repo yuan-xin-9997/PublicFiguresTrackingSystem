@@ -31,7 +31,7 @@ pipeline {
         }
         stage('OpenSpec validation') {
             steps {
-                sh 'npx --yes @fission-ai/openspec@1.6.0 validate remove-event-review-flow --type change --strict'
+                sh 'npx --yes @fission-ai/openspec@1.6.0 validate --all --strict'
             }
         }
         stage('Stop current service') {

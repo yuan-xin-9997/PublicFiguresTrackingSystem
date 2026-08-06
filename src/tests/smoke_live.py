@@ -34,13 +34,9 @@ def main() -> int:
         digest_rules.raise_for_status()
         digest_runs = client.get("/api/v1/notifications/digests/runs?page_size=1")
         digest_runs.raise_for_status()
-        incremental_config = client.get("/api/v1/notifications/incremental/config")
-        incremental_config.raise_for_status()
-        incremental_payload = incremental_config.json()["config"]
-        assert incremental_payload["timezone"] == "Asia/Shanghai"
-        assert incremental_payload["default_send_times"]
-        incremental_runs = client.get("/api/v1/notifications/incremental/runs?page_size=1")
-        incremental_runs.raise_for_status()
+        digest_options = client.get("/api/v1/notifications/digests/options")
+        digest_options.raise_for_status()
+        assert "information_sources" in digest_options.json()
         suffix = uuid.uuid4().hex[:8]
         person = client.post("/api/v1/persons", json={
             "name": "冒烟测试人物-" + suffix,

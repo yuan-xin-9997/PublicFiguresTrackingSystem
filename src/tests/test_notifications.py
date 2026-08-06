@@ -8,9 +8,7 @@ from app.backend.notifications import (
     NotificationWorker,
     build_batch_message,
     effective_email_config,
-    enqueue_task_run,
     save_email_overrides,
-    save_rule,
     send_message,
 )
 from app.backend.security import utc_now
@@ -55,6 +53,24 @@ def _seed_delivery_data(db, event_count=2):
     return task_id, run_id, event_ids
 
 
+def _seed_delivery_batch(db, run_id, event_ids, recipient="to@example.com"):
+    """Manually seed an immediate email delivery batch (replaces enqueue_task_run)."""
+    now = utc_now()
+    batch_id = db.execute(
+        "INSERT INTO email_delivery_batches(task_run_id,recipient,part_number,status,"
+        "attempt_count,next_attempt_at,last_error,message_id,created_at,updated_at) "
+        "VALUES(?,?,1,'pending',0,?,?,?,?,?)",
+        (run_id, recipient, now, "", "<batch-{}@local>".format(run_id), now, now),
+    )
+    for event_id in event_ids:
+        db.execute(
+            "INSERT INTO email_delivery_items(batch_id,task_run_id,event_id,recipient,status,created_at) "
+            "VALUES(?,?,?,?,'pending',?)",
+            (batch_id, run_id, event_id, recipient, now),
+        )
+    return batch_id
+
+
 def _enable_email(settings, db, monkeypatch, max_events=25, max_attempts=2):
     monkeypatch.setenv("PFTS_NOTIFICATION_CREDENTIAL_KEY", Fernet.generate_key().decode("ascii"))
     save_email_overrides(
@@ -87,19 +103,23 @@ def test_notification_migration_is_repeatable_and_preserves_existing_rows(tmp_pa
     )
     db.initialize()
     assert db.fetch_one("SELECT name FROM public_figures")["name"] == "保留人物"
-    assert db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")["version"] == 8
-    expected = {
-        "notification_settings", "notification_rules", "notification_rule_tasks",
-        "notification_rule_persons",
+    assert db.fetch_one("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1")["version"] == 9
+    actual = {row["name"] for row in db.fetch_all("SELECT name FROM sqlite_master WHERE type='table'")}
+    # retained tables (immediate push + daily digest) still exist
+    retained = {
         "task_run_events", "email_delivery_batches", "email_delivery_items",
         "daily_digest_rules", "daily_digest_rule_persons",
-        "daily_digest_rule_recipients", "daily_digest_runs",
-        "daily_digest_batches", "daily_digest_items",
+        "daily_digest_rule_recipients", "daily_digest_rule_sources",
+        "daily_digest_runs", "daily_digest_batches", "daily_digest_items",
+    }
+    assert retained <= actual
+    # retired tables (push rules + scheduled incremental) are gone
+    retired = {
+        "notification_rules", "notification_rule_tasks", "notification_rule_persons",
         "scheduled_notification_runs", "scheduled_notification_batches",
         "scheduled_notification_items",
     }
-    actual = {row["name"] for row in db.fetch_all("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert expected <= actual
+    assert retired.isdisjoint(actual)
 
 
 def test_page_config_encrypts_password_and_clear_falls_back(configured_app, monkeypatch):
@@ -137,84 +157,6 @@ def test_page_password_requires_external_key(configured_app, monkeypatch):
     monkeypatch.delenv("PFTS_NOTIFICATION_CREDENTIAL_KEY", raising=False)
     with pytest.raises(ValueError, match="加密主密钥"):
         save_email_overrides(db, settings, {}, [], "secret", False, None)
-
-
-def test_outbox_filters_chunks_and_deduplicates_overlapping_rules(configured_app, monkeypatch):
-    db = configured_app.state.db
-    settings = configured_app.state.settings
-    db.initialize()
-    task_id, run_id, event_ids = _seed_delivery_data(db, 2)
-    _enable_email(settings, db, monkeypatch, max_events=1)
-    save_rule(db, "规则一", [task_id], ["itinerary"], True)
-    save_rule(db, "规则二", [task_id], ["itinerary", "statement"], True)
-
-    first = enqueue_task_run(db, settings, run_id)
-    second = enqueue_task_run(db, settings, run_id)
-    assert first == {"candidates": 2, "enqueued": 4, "skipped": 0, "batches": 4}
-    assert second["enqueued"] == 0
-    assert db.fetch_one("SELECT COUNT(*) n FROM email_delivery_items")["n"] == 4
-    assert db.fetch_one("SELECT COUNT(*) n FROM email_delivery_batches")["n"] == 4
-    assert {row["event_id"] for row in db.fetch_all("SELECT event_id FROM email_delivery_items")} == set(event_ids)
-
-
-def test_outbox_person_filter_is_optional_and_limits_matching(configured_app, monkeypatch):
-    db = configured_app.state.db
-    settings = configured_app.state.settings
-    db.initialize()
-    task_id, run_id, event_ids = _seed_delivery_data(db, 1)
-    first_person = db.fetch_one("SELECT person_id FROM timeline_events WHERE id=?", (event_ids[0],))["person_id"]
-    now = utc_now()
-    second_person = db.execute(
-        "INSERT INTO public_figures(name,created_at,updated_at) VALUES(?,?,?)",
-        ("第二人物", now, now),
-    )
-    second_event = db.execute(
-        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,location_name,"
-        "confirmation_status,review_status,dedup_key,created_at,updated_at) "
-        "VALUES(?,'itinerary',?,?,?,?,?,'approved',?,?,?)",
-        (
-            second_person, "第二人物事件", "摘要", "2026-07-26T03:00:00+00:00",
-            "上海", "confirmed", "notification-person-second", now, now,
-        ),
-    )
-    db.execute(
-        "INSERT INTO task_run_events(run_id,event_id,created_at) VALUES(?,?,?)",
-        (run_id, second_event, now),
-    )
-    _enable_email(settings, db, monkeypatch)
-
-    all_rule = save_rule(db, "全部人物", [task_id], ["itinerary"], True, person_ids=[])
-    assert all_rule["person_ids"] == []
-    assert enqueue_task_run(db, settings, run_id)["candidates"] == 2
-
-    db.execute("DELETE FROM email_delivery_batches")
-    db.execute("DELETE FROM notification_rules")
-    selected_rule = save_rule(
-        db, "指定人物", [task_id], ["itinerary"], True, person_ids=[first_person],
-    )
-    assert selected_rule["person_ids"] == [first_person]
-    assert enqueue_task_run(db, settings, run_id)["candidates"] == 1
-    assert {
-        row["event_id"] for row in db.fetch_all("SELECT event_id FROM email_delivery_items")
-    } == {event_ids[0]}
-
-
-def test_outbox_skips_selected_person_after_person_becomes_unavailable(configured_app, monkeypatch):
-    db = configured_app.state.db
-    settings = configured_app.state.settings
-    db.initialize()
-    task_id, run_id, event_ids = _seed_delivery_data(db, 1)
-    person_id = db.fetch_one("SELECT person_id FROM timeline_events WHERE id=?", (event_ids[0],))["person_id"]
-    _enable_email(settings, db, monkeypatch)
-    save_rule(db, "指定人物", [task_id], ["itinerary"], True, person_ids=[person_id])
-    db.execute(
-        "UPDATE public_figures SET enabled=0,deleted_at=?,updated_at=? WHERE id=?",
-        (utc_now(), utc_now(), person_id),
-    )
-
-    assert enqueue_task_run(db, settings, run_id) == {
-        "candidates": 0, "enqueued": 0, "skipped": 0, "batches": 0,
-    }
 
 
 def test_analyze_records_only_events_first_created_by_task_run(configured_app):
@@ -269,10 +211,12 @@ def test_message_content_and_worker_success(configured_app, monkeypatch):
     db = configured_app.state.db
     settings = configured_app.state.settings
     db.initialize()
-    task_id, run_id, _ = _seed_delivery_data(db, 1)
+    _, run_id, _ = _seed_delivery_data(db, 1)
     _enable_email(settings, db, monkeypatch)
-    save_rule(db, "规则", [task_id], ["itinerary"], True)
-    enqueue_task_run(db, settings, run_id)
+    event_ids = [row["event_id"] for row in db.fetch_all(
+        "SELECT event_id FROM task_run_events WHERE run_id=?", (run_id,)
+    )]
+    _seed_delivery_batch(db, run_id, event_ids)
     batch = db.fetch_one("SELECT * FROM email_delivery_batches ORDER BY id")
     config, _ = effective_email_config(settings, db, include_secret=True)
     message, deliverable, skipped = build_batch_message(db, settings, batch["id"], config)
@@ -295,10 +239,12 @@ def test_worker_retries_then_fails_without_changing_task_run(configured_app, mon
     db = configured_app.state.db
     settings = configured_app.state.settings
     db.initialize()
-    task_id, run_id, _ = _seed_delivery_data(db, 1)
+    _, run_id, _ = _seed_delivery_data(db, 1)
     _enable_email(settings, db, monkeypatch, max_attempts=2)
-    save_rule(db, "规则", [task_id], ["itinerary"], True)
-    enqueue_task_run(db, settings, run_id)
+    event_ids = [row["event_id"] for row in db.fetch_all(
+        "SELECT event_id FROM task_run_events WHERE run_id=?", (run_id,)
+    )]
+    _seed_delivery_batch(db, run_id, event_ids)
     monkeypatch.setattr(
         "app.backend.notifications.send_message",
         lambda cfg, msg: (_ for _ in ()).throw(TimeoutError("to@example.com timed out")),
@@ -360,10 +306,12 @@ def test_smtp_transport_modes_and_restart_recovery(configured_app, monkeypatch):
     db = configured_app.state.db
     settings = configured_app.state.settings
     db.initialize()
-    task_id, run_id, _ = _seed_delivery_data(db, 1)
+    _, run_id, _ = _seed_delivery_data(db, 1)
     _enable_email(settings, db, monkeypatch)
-    save_rule(db, "恢复规则", [task_id], ["itinerary"], True)
-    enqueue_task_run(db, settings, run_id)
+    event_ids = [row["event_id"] for row in db.fetch_all(
+        "SELECT event_id FROM task_run_events WHERE run_id=?", (run_id,)
+    )]
+    _seed_delivery_batch(db, run_id, event_ids)
     db.execute("UPDATE email_delivery_batches SET status='sending'")
     monkeypatch.setattr("app.backend.notifications.NotificationWorker._loop", lambda self: None)
     worker = NotificationWorker(db, settings)
@@ -396,27 +344,33 @@ def test_notification_api_permissions_rules_and_audit(admin_client, configured_a
     assert options.json()["persons"] == [{
         "id": person_id, "name": "测试人物", "organization": "", "title": "",
     }]
-    created = admin_client.post("/api/v1/notifications/rules", json={
-        "name": "API 规则", "task_ids": [task_id], "person_ids": [person_id],
-        "event_types": ["statement"], "enabled": True,
+    # removed push-rule / incremental routes are gone
+    assert admin_client.get("/api/v1/notifications/rules").status_code == 404
+    assert admin_client.get("/api/v1/notifications/incremental/config").status_code == 404
+
+    created = admin_client.post("/api/v1/notifications/digests/rules", json={
+        "name": "API 动态推送", "person_ids": [person_id],
+        "event_types": ["statement"], "recipients": ["to@example.com"],
+        "send_time": "09:00", "enabled": True,
     })
     assert created.status_code == 201, created.text
     assert created.json()["person_ids"] == [person_id]
-    assert admin_client.get("/api/v1/notifications/rules").json()["total"] == 1
+    assert admin_client.get("/api/v1/notifications/digests/rules").json()["total"] == 1
 
     monkeypatch.setattr("app.backend.main.send_test_email", lambda settings, db: None)
     assert admin_client.post("/api/v1/notifications/email/test").status_code == 200
     audits = admin_client.get("/api/v1/audit-logs").json()["items"]
     assert any(item["object_type"] == "notification_email_config" for item in audits)
-    assert any(item["object_type"] == "notification_rule" for item in audits)
+    assert any(item["object_type"] == "daily_digest_rule" for item in audits)
 
     users = admin_client.get("/api/v1/users").json()["items"]
     analyst = next(item for item in users if item["username"] == "analyst")
     admin_client.put("/api/v1/users/{}/permissions".format(analyst["id"]), json={"pages": ["notifications"]})
     admin_client.post("/api/v1/auth/logout")
     assert admin_client.post("/api/v1/auth/login", json={"username": "analyst", "password": "reader123"}).status_code == 200
-    assert admin_client.get("/api/v1/notifications/rules").status_code == 200
-    forbidden = admin_client.post("/api/v1/notifications/rules", json={
-        "name": "越权规则", "task_ids": [task_id], "event_types": ["other"], "enabled": True,
+    assert admin_client.get("/api/v1/notifications/digests/rules").status_code == 200
+    forbidden = admin_client.post("/api/v1/notifications/digests/rules", json={
+        "name": "越权动态推送", "person_ids": [person_id], "event_types": ["other"],
+        "recipients": ["x@example.com"],
     })
     assert forbidden.status_code == 403

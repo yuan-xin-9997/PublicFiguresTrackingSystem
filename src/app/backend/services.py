@@ -18,7 +18,6 @@ from .collectors import (
 from .config import Settings
 from .database import Database, json_text
 from .extractor import event_core_text, extract, validate_document_evidence_subject
-from .notifications import enqueue_task_run, sanitize_error
 from .security import utc_now
 
 
@@ -316,16 +315,8 @@ def run_collection_task(db: Database, task_id: int, settings: Settings) -> Dict[
             "rejection_reasons": attribution_reasons,
         },
     )
-    notification_counters = {"candidates": 0, "enqueued": 0, "skipped": 0, "batches": 0}
-    try:
-        notification_counters = enqueue_task_run(db, settings, run_id)
-        add_task_log(db, run_id, "INFO", "邮件推送排队统计", notification_counters)
-    except Exception as exc:
-        safe_error = sanitize_error(exc)
-        add_task_log(db, run_id, "ERROR", "邮件推送排队失败", {"error": safe_error})
-        LOGGER.exception("notification enqueue failed for task run %s", run_id)
     return {"run_id": run_id, "status": status, **counters, "error_summary": error_summary,
-            "discovery_stats": task.get("_discovery_stats"), "notifications": notification_counters}
+            "discovery_stats": task.get("_discovery_stats")}
 
 
 def _person_with_aliases(db: Database, person_id: int) -> Optional[Dict[str, Any]]:

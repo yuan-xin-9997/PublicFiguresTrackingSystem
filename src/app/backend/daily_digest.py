@@ -144,7 +144,7 @@ def digest_window(
     )
 
 
-def _rule_lists(db: Database, rule_id: int) -> Tuple[List[int], List[str]]:
+def _rule_lists(db: Database, rule_id: int) -> Tuple[List[int], List[str], List[int]]:
     persons = [
         int(row["person_id"]) for row in db.fetch_all(
             "SELECT person_id FROM daily_digest_rule_persons WHERE rule_id=? ORDER BY person_id",
@@ -157,7 +157,13 @@ def _rule_lists(db: Database, rule_id: int) -> Tuple[List[int], List[str]]:
             (rule_id,),
         )
     ]
-    return persons, recipients
+    sources = [
+        int(row["source_id"]) for row in db.fetch_all(
+            "SELECT source_id FROM daily_digest_rule_sources WHERE rule_id=? ORDER BY source_id",
+            (rule_id,),
+        )
+    ]
+    return persons, recipients, sources
 
 
 def _hydrate_rule(db: Database, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,7 +175,7 @@ def _hydrate_rule(db: Database, row: Dict[str, Any]) -> Dict[str, Any]:
         ]
     except (TypeError, ValueError):
         item["event_types"] = []
-    item["person_ids"], item["recipients"] = _rule_lists(db, int(item["id"]))
+    item["person_ids"], item["recipients"], item["source_ids"] = _rule_lists(db, int(item["id"]))
     item["enabled"] = bool(item["enabled"])
     item["send_when_empty"] = bool(item["send_when_empty"])
     return item
@@ -201,6 +207,7 @@ def _normalize_rule_values(
     person_ids: Iterable[int],
     event_types: Iterable[str],
     recipients: Iterable[str],
+    source_ids: Iterable[int],
     send_time: Optional[str],
     window_mode: Optional[str],
     rolling_hours: Optional[int],
@@ -212,6 +219,7 @@ def _normalize_rule_values(
     clean_persons = sorted(set(int(value) for value in person_ids))
     if not clean_persons:
         raise ValueError("日报规则至少选择一个人物")
+    clean_sources = sorted(set(int(value) for value in source_ids))
     clean_types = sorted(set(str(value) for value in event_types))
     if not clean_types or any(value not in EVENT_TYPES for value in clean_types):
         raise ValueError("日报规则至少选择一个有效事件类型")
@@ -236,6 +244,7 @@ def _normalize_rule_values(
         "name": clean_name,
         "person_ids": clean_persons,
         "event_types": clean_types,
+        "source_ids": clean_sources,
         "recipients": clean_recipients,
         "send_time": clean_time,
         "window_mode": clean_mode,
@@ -250,6 +259,7 @@ def save_digest_rule(
     person_ids: Iterable[int],
     event_types: Iterable[str],
     recipients: Iterable[str],
+    source_ids: Iterable[int] = (),
     enabled: bool = True,
     send_time: Optional[str] = None,
     window_mode: Optional[str] = None,
@@ -259,7 +269,7 @@ def save_digest_rule(
 ) -> Dict[str, Any]:
     values = _normalize_rule_values(
         settings, name, person_ids, event_types, recipients,
-        send_time, window_mode, rolling_hours,
+        source_ids, send_time, window_mode, rolling_hours,
     )
     placeholders = ",".join("?" for _ in values["person_ids"])
     found = db.fetch_all(
@@ -269,6 +279,15 @@ def save_digest_rule(
     )
     if len(found) != len(values["person_ids"]):
         raise ValueError("日报规则包含不存在或不可用的人物")
+    if values["source_ids"]:
+        source_placeholders = ",".join("?" for _ in values["source_ids"])
+        found_sources = db.fetch_all(
+            "SELECT id FROM information_sources WHERE deleted_at IS NULL "
+            "AND id IN ({})".format(source_placeholders),
+            values["source_ids"],
+        )
+        if len(found_sources) != len(values["source_ids"]):
+            raise ValueError("日报规则包含不存在或不可用的信息源")
     config, _ = effective_digest_config(settings)
     now = utc_now()
     next_run = _utc_iso(next_scheduled_at(
@@ -314,6 +333,9 @@ def save_digest_rule(
             connection.execute(
                 "DELETE FROM daily_digest_rule_recipients WHERE rule_id=?", (rule_id,)
             )
+            connection.execute(
+                "DELETE FROM daily_digest_rule_sources WHERE rule_id=?", (rule_id,)
+            )
         connection.executemany(
             "INSERT INTO daily_digest_rule_persons(rule_id,person_id) VALUES(?,?)",
             [(rule_id, value) for value in values["person_ids"]],
@@ -321,6 +343,10 @@ def save_digest_rule(
         connection.executemany(
             "INSERT INTO daily_digest_rule_recipients(rule_id,recipient) VALUES(?,?)",
             [(rule_id, value) for value in values["recipients"]],
+        )
+        connection.executemany(
+            "INSERT INTO daily_digest_rule_sources(rule_id,source_id) VALUES(?,?)",
+            [(rule_id, value) for value in values["source_ids"]],
         )
     return get_digest_rule(db, int(rule_id))
 
@@ -368,11 +394,23 @@ def digest_candidates(
     event_types: Sequence[str],
     window_start: datetime,
     window_end: datetime,
+    source_ids: Optional[Sequence[int]] = None,
 ) -> List[Dict[str, Any]]:
     if not person_ids or not event_types:
         return []
     person_placeholders = ",".join("?" for _ in person_ids)
     type_placeholders = ",".join("?" for _ in event_types)
+    params: List[Any] = list(person_ids) + list(event_types)
+    source_clause = ""
+    clean_sources = [int(value) for value in (source_ids or []) if value]
+    if clean_sources:
+        source_placeholders = ",".join("?" for _ in clean_sources)
+        source_clause = (
+            " AND EXISTS (SELECT 1 FROM event_evidence ev "
+            "JOIN raw_documents d ON d.id=ev.document_id "
+            "WHERE ev.event_id=e.id AND d.source_id IN ({}))".format(source_placeholders)
+        )
+        params += clean_sources
     rows = db.fetch_all(
         "SELECT e.*,p.name AS person_name,"
         "COALESCE((SELECT GROUP_CONCAT(DISTINCT s.name) FROM event_evidence ev "
@@ -381,10 +419,10 @@ def digest_candidates(
         "WHERE ev.event_id=e.id),'') AS source_names "
         "FROM timeline_events e JOIN public_figures p ON p.id=e.person_id "
         "WHERE e.review_status!='rejected' AND p.enabled=1 AND p.deleted_at IS NULL "
-        "AND e.person_id IN ({}) AND e.event_type IN ({})".format(
-            person_placeholders, type_placeholders
+        "AND e.person_id IN ({}) AND e.event_type IN ({}){}".format(
+            person_placeholders, type_placeholders, source_clause
         ),
-        list(person_ids) + list(event_types),
+        params,
     )
     selected = []
     for row in rows:
@@ -422,7 +460,8 @@ def preview_digest(
         int(rule["rolling_hours"]), config["timezone"],
     )
     rows = digest_candidates(
-        db, rule["person_ids"], rule["event_types"], start, end
+        db, rule["person_ids"], rule["event_types"], start, end,
+        source_ids=rule.get("source_ids"),
     )
     return {
         "rule_id": rule_id,
@@ -477,7 +516,8 @@ def create_digest_run(
     if existing:
         return existing
     candidates = digest_candidates(
-        db, rule["person_ids"], rule["event_types"], start, end
+        db, rule["person_ids"], rule["event_types"], start, end,
+        source_ids=rule.get("source_ids"),
     )
     now = utc_now()
     max_events = int(
