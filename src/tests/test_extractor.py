@@ -1,5 +1,7 @@
 import json
+import sqlite3
 
+from app.backend.database import SCHEMA, migrate_event_time_to_publish_time
 from app.backend.extractor import event_dedup_key, external_extract, extract, local_extract, normalize_location
 from app.backend.services import _event_similarity
 
@@ -39,21 +41,26 @@ def test_month_day_uses_article_timestamp_instead_of_runtime_year():
         [{"id": 1, "name": "张三", "aliases": []}], 0.7,
     )
     assert events[0]["start_at"] == "2023-12-04T00:31:00+00:00"
-    assert events[0]["time_precision"] == "exact"
+    assert events[0]["time_precision"] == "day"
 
 
-def test_full_chinese_date_is_saved_as_beijing_calendar_day():
+def test_body_full_date_does_not_override_published_at():
+    """The user-reported bug: a body-text full date (e.g. a referenced
+    historical or effective date) MUST NOT override the article's publication
+    time. start_at is always the published_at; time_precision is "day"."""
     events = local_extract(
         {
-            "title": "公开行程",
-            "content_text": "2023年12月3日，张三在上海出席会议。",
-            "published_at": "2023-12-04T08:31:00+08:00",
+            "title": "李强签署国务院令 公布修订后的《集成电路布图设计保护条例》",
+            "content_text": "2026年7月15日国务院公布修订后的条例，自2026年9月1日起施行。李强签署国务院令，并表示将推进相关工作。",
+            "published_at": "2026-08-03T00:00:00+08:00",
             "language": "zh-CN",
         },
-        [{"id": 1, "name": "张三", "aliases": []}], 0.7,
+        [{"id": 1, "name": "李强", "aliases": []}], 0.7,
     )
-    assert events[0]["start_at"] == "2023-12-03T00:00:00+08:00"
-    assert events[0]["time_precision"] == "day"
+    assert events
+    for event in events:
+        assert event["start_at"] == "2026-08-02T16:00:00+00:00"
+        assert event["time_precision"] == "day"
 
 
 def test_local_extractor_keeps_evidence_and_unknowns():
@@ -293,3 +300,170 @@ def test_external_wrong_person_is_rejected_and_fallback_uses_same_rules(monkeypa
     fallback_result = extract(document, persons, config)
     assert fallback_result["provider"] == "local-fallback"
     assert fallback_result["events"] == []
+
+
+def test_external_body_date_in_start_at_is_overridden_by_published_at(monkeypatch):
+    """The external model is no longer asked for start_at; even if it returns
+    a body-text date, the system MUST overwrite it with the article's
+    published_at."""
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def read(self):
+            payload = {"events": [{
+                "person_id": 1, "event_type": "statement", "title": "签署",
+                "summary": "李强签署国务院令并表示将推进相关工作。",
+                "start_at": "2025-06-01T00:00:00+08:00",
+                "location_name": "", "confirmation_status": "completed",
+                "confidence": 0.8, "quote_text": "",
+                "evidence_text": "李强签署国务院令并表示将推进相关工作。",
+            }]}
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}).encode()
+
+    monkeypatch.setenv("TEST_AI_KEY2", "secret")
+    monkeypatch.setattr("app.backend.extractor.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    events = external_extract(
+        {
+            "title": "签署", "content_text": "李强签署国务院令并表示将推进相关工作。",
+            "published_at": "2026-08-03T00:00:00+08:00", "language": "zh-CN",
+        },
+        [{"id": 1, "name": "李强", "aliases": []}],
+        {"base_url": "https://ai.example", "api_key_env": "TEST_AI_KEY2", "model": "test", "review_threshold": 0.7},
+    )
+    assert events[0]["start_at"] == "2026-08-02T16:00:00+00:00"
+    assert events[0]["time_precision"] == "day"
+
+
+def test_future_tense_event_uses_published_at_and_completed():
+    """Future-scheduled events (将于/计划) also use the publish time. Their
+    confirmation is "completed" (publish time is in the past), but rumor
+    keywords (预计/或将) still flip the status to "expected"."""
+    document = {
+        "title": "公开行程", "published_at": "2026-08-05T00:00:00+08:00", "language": "zh-CN",
+        "content_text": "李强将于8月20日访问俄罗斯。",
+    }
+    events = local_extract(document, [{"id": 1, "name": "李强", "aliases": []}], 0.7)
+    assert events
+    itinerary = next(event for event in events if event["event_type"] == "itinerary")
+    assert itinerary["start_at"] == "2026-08-04T16:00:00+00:00"
+    assert itinerary["time_precision"] == "day"
+    assert itinerary["confirmation_status"] == "completed"
+
+    rumored_document = {
+        "title": "可能出席", "published_at": "2026-08-05T00:00:00+08:00", "language": "zh-CN",
+        "content_text": "李强或将出席下周论坛。",
+    }
+    rumored_events = local_extract(rumored_document, [{"id": 1, "name": "李强", "aliases": []}], 0.7)
+    assert rumored_events
+    assert rumored_events[0]["start_at"] == "2026-08-04T16:00:00+00:00"
+    assert rumored_events[0]["confirmation_status"] in ("expected", "rumored")
+
+
+def _seed_migration_db():
+    """Build an in-memory database with the production schema and seed it
+    with events that simulate pre-migration body-date contamination."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(SCHEMA)
+    connection.execute(
+        "INSERT INTO users(username,password_hash,role,enabled,created_at,updated_at) "
+        "VALUES('admin','x','admin',1,datetime('now'),datetime('now'))"
+    )
+    connection.execute(
+        "INSERT INTO public_figures(name,enabled,created_at,updated_at) VALUES('张三',1,datetime('now'),datetime('now'))"
+    )
+    person_id = 1
+    connection.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES('seed','rss',datetime('now'),datetime('now'))"
+    )
+    source_id = connection.execute("SELECT id FROM information_sources WHERE name='seed'").fetchone()[0]
+    # Document with a known published_at.
+    connection.execute(
+        "INSERT INTO raw_documents(source_id,canonical_url,title,author,published_at,collected_at,content_text,content_hash,fetch_metadata_json) "
+        "VALUES(?, 'https://example/lq', '签署', '', '2026-08-03T00:00:00+08:00', '2026-08-03T00:00:00+08:00', '签署', 'h1','{}')",
+        (source_id,),
+    )
+    document_id = connection.execute("SELECT id FROM raw_documents WHERE canonical_url='https://example/lq'").fetchone()[0]
+    # Non-locked event with a body-date start_at and a stale dedup_key.
+    connection.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,location_name,location_precision,confirmation_status,review_status,confidence,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?, 'other', '签署', '李强签署国务院令。', '2014-10-01T00:00:00+08:00', NULL, 'Asia/Shanghai', 'day', '', 'unknown', 'completed', 'approved', 0.6, 'stale-key-1', 0, datetime('now'), datetime('now'))",
+        (person_id,),
+    )
+    target_event_id = connection.execute("SELECT id FROM timeline_events WHERE dedup_key='stale-key-1'").fetchone()[0]
+    connection.execute(
+        "INSERT INTO event_evidence(event_id, document_id, evidence_text, supports_fields_json, source_claim_json) "
+        "VALUES(?, ?, '李强签署国务院令。', '[]', '{}')",
+        (target_event_id, document_id),
+    )
+    # Human-locked event that MUST be skipped.
+    connection.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,location_name,location_precision,confirmation_status,review_status,confidence,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?, 'other', '锁定事件', '人工锁定', '2010-01-01T00:00:00+08:00', NULL, 'Asia/Shanghai', 'day', '', 'unknown', 'completed', 'approved', 0.5, 'locked-key', 1, datetime('now'), datetime('now'))",
+        (person_id,),
+    )
+    locked_event_id = connection.execute("SELECT id FROM timeline_events WHERE dedup_key='locked-key'").fetchone()[0]
+    connection.execute(
+        "INSERT INTO event_evidence(event_id, document_id, evidence_text, supports_fields_json, source_claim_json) "
+        "VALUES(?, ?, '人工锁定证据。', '[]', '{}')",
+        (locked_event_id, document_id),
+    )
+    # Second non-locked event pointing at the same document with the same evidence
+    # text. After the migration they collapse onto the same dedup_key; the
+    # smaller id wins and the other is deleted.
+    connection.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,location_name,location_precision,confirmation_status,review_status,confidence,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?, 'other', '签署副本', '李强签署国务院令。', '2014-10-01T00:00:00+08:00', NULL, 'Asia/Shanghai', 'day', '', 'unknown', 'completed', 'approved', 0.6, 'stale-key-2', 0, datetime('now'), datetime('now'))",
+        (person_id,),
+    )
+    dup_event_id = connection.execute("SELECT id FROM timeline_events WHERE dedup_key='stale-key-2'").fetchone()[0]
+    connection.execute(
+        "INSERT INTO event_evidence(event_id, document_id, evidence_text, supports_fields_json, source_claim_json) "
+        "VALUES(?, ?, '李强签署国务院令。', '[]', '{}')",
+        (dup_event_id, document_id),
+    )
+    return connection, document_id, target_event_id, locked_event_id, dup_event_id
+
+
+def test_migration_repairs_start_at_and_merges_duplicates_and_is_idempotent():
+    connection, document_id, target_id, locked_id, dup_id = _seed_migration_db()
+    counts = migrate_event_time_to_publish_time(connection)
+    assert counts["repaired"] == 1
+    assert counts["deleted_duplicates"] == 1
+    assert counts["skipped_locked"] == 1
+
+    rows = list(connection.execute(
+        "SELECT id, person_id, event_type, start_at, time_precision, original_timezone, dedup_key, human_locked "
+        "FROM timeline_events ORDER BY id"
+    ).fetchall())
+    # The locked event is untouched.
+    locked_row = next(row for row in rows if row["id"] == locked_id)
+    assert locked_row["start_at"] == "2010-01-01T00:00:00+08:00"
+    assert locked_row["dedup_key"] == "locked-key"
+    assert locked_row["human_locked"] == 1
+    # The duplicate non-locked event was removed; the original survivor was
+    # rewritten to the document's published_at with a recomputed dedup_key.
+    surviving_ids = {row["id"] for row in rows if row["id"] != locked_id}
+    assert surviving_ids == {target_id}
+    repaired_row = next(row for row in rows if row["id"] == target_id)
+    assert repaired_row["start_at"] == "2026-08-02T16:00:00+00:00"
+    assert repaired_row["time_precision"] == "day"
+    assert repaired_row["original_timezone"] == "Asia/Shanghai"
+    assert repaired_row["dedup_key"] != "stale-key-1"
+    assert repaired_row["human_locked"] == 0
+    # An audit row was written.
+    audit_count = connection.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
+    assert audit_count == 1
+
+    # Idempotency: a second pass produces no further changes.
+    second = migrate_event_time_to_publish_time(connection)
+    assert second["repaired"] == 0
+    assert second["deleted_duplicates"] == 0
+    again = connection.execute(
+        "SELECT start_at, dedup_key FROM timeline_events WHERE id=?", (target_id,)
+    ).fetchone()
+    assert again[0] == "2026-08-02T16:00:00+00:00"
+    connection.close()

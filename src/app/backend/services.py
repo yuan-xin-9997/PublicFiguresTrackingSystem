@@ -174,12 +174,12 @@ def analyze_document(
                 incoming_location = event.get("location_name", "")[:300]
                 connection.execute(
                     "UPDATE timeline_events SET "
-                    "start_at=CASE WHEN ? IS NOT NULL AND (start_at IS NULL OR start_at>?) THEN ? ELSE start_at END,"
+                    "start_at=CASE WHEN ? IS NOT NULL THEN ? ELSE start_at END,"
                     "location_name=CASE WHEN length(?)>length(location_name) THEN ? ELSE location_name END,"
                     "location_precision=CASE WHEN length(?)>length(location_name) THEN ? ELSE location_precision END,updated_at=? "
                     "WHERE id=? AND human_locked=0",
                     (
-                        incoming_start, incoming_start, incoming_start,
+                        incoming_start, incoming_start,
                         incoming_location, incoming_location, incoming_location,
                         event.get("location_precision", "unknown"), now, event_id,
                     ),

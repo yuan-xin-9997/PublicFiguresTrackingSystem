@@ -2,7 +2,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 
 SCHEMA = """
@@ -563,6 +563,15 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(9, datetime('now'))"
                 )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=10").fetchone():
+                # Re-source event occurrence time from the article's publication
+                # time. Repair non-locked events whose start_at was overwritten
+                # by body-text date extraction; recompute dedup_key so future
+                # re-analysis stays consistent.
+                migrate_event_time_to_publish_time(connection)
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(10, datetime('now'))"
+                )
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -600,3 +609,125 @@ class Database:
 
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def migrate_event_time_to_publish_time(connection: sqlite3.Connection) -> Dict[str, int]:
+    """One-shot migration (schema_version 10): re-source event ``start_at``
+    from each event's earliest evidence document publication time.
+
+    For every ``human_locked=0`` event with at least one evidence document
+    whose ``COALESCE(published_at, collected_at)`` is non-null, this migration
+    normalizes that timestamp via ``extractor._publish_time`` and recomputes
+    ``dedup_key`` via ``extractor.event_dedup_key`` (text = first evidence
+    snippet, falling back to the event title). Collisions with locked events,
+    with unrepairable non-locked events, or among the repair set itself are
+    resolved by dropping the redundant non-locked record; human-locked events
+    are never modified or deleted.
+
+    Idempotent: re-running on a repaired database recomputes the same
+    ``start_at`` and ``dedup_key`` values, producing no further changes.
+    """
+    from app.backend.extractor import _publish_time, event_dedup_key
+
+    counts: Dict[str, int] = {"repaired": 0, "skipped_locked": 0, "deleted_duplicates": 0}
+
+    repair_rows = connection.execute(
+        """
+        SELECT te.id AS id, te.person_id AS person_id, te.event_type AS event_type,
+               te.dedup_key AS old_key, te.start_at AS old_start, te.title AS title,
+               (SELECT COALESCE(d.published_at, d.collected_at)
+                FROM event_evidence ev JOIN raw_documents d ON d.id = ev.document_id
+                WHERE ev.event_id = te.id
+                ORDER BY COALESCE(d.published_at, d.collected_at), d.id
+                LIMIT 1) AS doc_time,
+               (SELECT ee.evidence_text FROM event_evidence ee
+                WHERE ee.event_id = te.id ORDER BY ee.id LIMIT 1) AS evidence_text
+        FROM timeline_events te
+        WHERE te.human_locked = 0
+          AND EXISTS (
+              SELECT 1 FROM event_evidence ev
+              JOIN raw_documents d ON d.id = ev.document_id
+              WHERE ev.event_id = te.id
+                AND COALESCE(d.published_at, d.collected_at) IS NOT NULL
+          )
+        """
+    ).fetchall()
+
+    proposed: List[Dict[str, Any]] = []
+    by_new_key: Dict[str, List[int]] = {}
+    for row in repair_rows:
+        new_start = _publish_time(row["doc_time"])
+        if not new_start:
+            # Unparseable document timestamp: leave the event untouched
+            # (keeps its prior start_at and dedup_key, treated as protected below).
+            continue
+        text = row["evidence_text"] or row["title"] or ""
+        new_key = event_dedup_key(row["person_id"], row["event_type"], new_start, text)
+        # Idempotency: skip rows that already carry the proposed values, so a
+        # repeated migration reports zero further changes.
+        if row["old_key"] == new_key and row["old_start"] == new_start:
+            continue
+        proposed.append({"id": row["id"], "new_start": new_start, "new_key": new_key})
+        by_new_key.setdefault(new_key, []).append(row["id"])
+
+    # Protected keys: locked events + non-locked events outside the repair set
+    # (including the unparseable rows above). Their current dedup_key must not
+    # be claimed by any survivor.
+    repair_ids = [p["id"] for p in proposed]
+    if repair_ids:
+        placeholders = ",".join("?" * len(repair_ids))
+        protected_rows = connection.execute(
+            f"SELECT dedup_key FROM timeline_events "
+            f"WHERE human_locked = 1 OR (human_locked = 0 AND id NOT IN ({placeholders}))",
+            tuple(repair_ids),
+        ).fetchall()
+    else:
+        protected_rows = connection.execute(
+            "SELECT dedup_key FROM timeline_events WHERE human_locked = 1"
+        ).fetchall()
+    protected_keys: Set[str] = {r["dedup_key"] for r in protected_rows}
+
+    to_delete: Set[int] = set()
+    survivors: List[Dict[str, Any]] = []
+    for new_key, ids in by_new_key.items():
+        ids_sorted = sorted(ids)
+        if new_key in protected_keys:
+            # Locked / unrepairable record already owns this key: drop the
+            # whole repair group rather than overwrite a protected event.
+            to_delete.update(ids_sorted)
+            continue
+        survivors.append(next(p for p in proposed if p["id"] == ids_sorted[0]))
+        to_delete.update(ids_sorted[1:])
+
+    # Stage: rewrite survivors' dedup_key to a per-row temporary value so the
+    # final UPDATE never trips a UNIQUE collision with a peer's old key.
+    if survivors:
+        connection.executemany(
+            "UPDATE timeline_events SET dedup_key = ? WHERE id = ?",
+            [(f"repair-migration-{p['id']}", p["id"]) for p in survivors],
+        )
+    if to_delete:
+        for event_id in sorted(to_delete):
+            connection.execute("DELETE FROM timeline_events WHERE id = ?", (event_id,))
+    if survivors:
+        connection.executemany(
+            "UPDATE timeline_events SET start_at = ?, dedup_key = ?, "
+            "time_precision = 'day', original_timezone = 'Asia/Shanghai' WHERE id = ?",
+            [(p["new_start"], p["new_key"], p["id"]) for p in survivors],
+        )
+
+    counts["repaired"] = len(survivors)
+    counts["deleted_duplicates"] = len(to_delete)
+    counts["skipped_locked"] = int(
+        connection.execute("SELECT COUNT(*) FROM timeline_events WHERE human_locked = 1").fetchone()[0]
+    )
+    connection.execute(
+        "INSERT INTO audit_logs(actor_id,action,object_type,result,change_summary,created_at) "
+        "VALUES(NULL,'migrate_event_time_to_publish','timeline_events','success',?,datetime('now'))",
+        (
+            "修复 {} 条 start_at；跳过 {} 条人工锁定；删除 {} 条重复。".format(
+                counts["repaired"], counts["skipped_locked"], counts["deleted_duplicates"]
+            ),
+        ),
+    )
+    return counts

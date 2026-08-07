@@ -4,18 +4,19 @@ import os
 import re
 import time
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
 ITINERARY_WORDS = ("访问", "出席", "前往", "抵达", "行程", "会见", "开展", "检查", "调研", "考察", "将于", "计划", "visit", "attend", "travel")
 STATEMENT_WORDS = ("表示", "称", "指出", "强调", "宣布", "说", "statement", "said", "says", "announced")
 OTHER_WORDS = ("获颁", "获赠", "获得", "赢得", "当选", "就任", "担任", "卸任", "辞去", "逝世", "去世", "被任命", "任命为")
-DATE_PATTERNS = [
-    re.compile(r"(?P<y>20\d{2})[-/.年](?P<m>\d{1,2})[-/.月](?P<d>\d{1,2})日?"),
-    re.compile(r"(?P<m>\d{1,2})月(?P<d>\d{1,2})日"),
-]
-BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+# Event occurrence time (start_at) is sourced exclusively from the article's
+# publication time. Body-text date extraction was removed because referenced
+# dates (effective dates, original-issue dates, historical dates) are
+# unreliable as the event's occurrence time. _content_units retains an inline
+# date regex for segmenting flattened list pages, independent of this concern.
 QUOTE_PATTERN = re.compile(r"[“\"]([^”\"]{4,400})[”\"]")
 LOCATION_PATTERN = re.compile(r"(?:在|前往|抵达|访问)([\u4e00-\u9fffA-Za-z·、\s]{2,30}?)(?=举行|出席|访问|会见|表示|指出|强调|宣布|开展|进行|调研|考察|检查|主持|召开)")
 LOCATION_ALIASES = {"首尔总统府": "韩国总统府"}
@@ -179,33 +180,26 @@ def event_dedup_key(person_id: int, event_type: str, start_at: Optional[str], te
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _iso_date(text: str, fallback: Optional[str]) -> Optional[str]:
-    # A month/day mention is not sufficiently anchored on its own: using the
-    # process year turned old articles into current-year events. Prefer the
-    # article's complete timestamp unless the evidence states the year too.
-    match = DATE_PATTERNS[0].search(text)
-    if match:
+def _publish_time(published_at: Optional[str]) -> Optional[str]:
+    """Normalize the article's publication time to a UTC ISO string.
+
+    Event occurrence time (`start_at`) is sourced exclusively from the
+    article's `published_at`. The value may arrive as ISO 8601 (HTML articles)
+    or RFC 2822 (RSS feeds); accept both and emit a tz-aware UTC ISO string so
+    downstream storage and the dedup key use one consistent format.
+    """
+    if not published_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
         try:
-            return datetime(
-                int(match.group("y")), int(match.group("m")), int(match.group("d")),
-                tzinfo=BEIJING_TIMEZONE,
-            ).isoformat()
-        except ValueError:
+            parsed = parsedate_to_datetime(published_at)
+        except (TypeError, ValueError, OverflowError):
             return None
-    if fallback:
-        try:
-            normalized = fallback.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).astimezone(timezone.utc).replace(microsecond=0).isoformat()
-        except ValueError:
-            return None
-    match = DATE_PATTERNS[1].search(text)
-    if match:
-        try:
-            now = datetime.now(BEIJING_TIMEZONE)
-            return datetime(now.year, int(match.group("m")), int(match.group("d")), tzinfo=BEIJING_TIMEZONE).isoformat()
-        except ValueError:
-            return None
-    return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _content_units(text: str) -> List[Dict[str, Any]]:
@@ -303,8 +297,7 @@ def _local_extract_with_stats(
                     _record_rejection(stats, reason)
                     continue
                 quote_match = QUOTE_PATTERN.search(segment) if event_type == "statement" else None
-                start_at = _iso_date(segment, document.get("published_at"))
-                has_explicit_full_date = bool(DATE_PATTERNS[0].search(segment))
+                start_at = _publish_time(document.get("published_at"))
                 location = _nearby_location(segments, segment_index)
                 confidence = 0.55 + (0.12 if start_at else 0) + (0.08 if quote_match else 0) + min(0.1, len(segment) / 1000)
                 confirmation = "completed" if start_at and start_at <= datetime.now(timezone.utc).isoformat() else "expected"
@@ -316,7 +309,7 @@ def _local_extract_with_stats(
                     "title": str(document.get("title") or "未命名材料")[:500],
                     "summary": segment[:500], "start_at": start_at, "end_at": None,
                     "original_timezone": "Asia/Shanghai" if start_at else "",
-                    "time_precision": "day" if has_explicit_full_date else ("exact" if start_at else "unknown"),
+                    "time_precision": "day" if start_at else "unknown",
                     "location_name": location, "location_precision": "city" if location else "unknown",
                     "confirmation_status": confirmation,
                     "review_status": "approved",
@@ -345,7 +338,7 @@ def _external_extract_with_stats(
         "task": "只根据正文抽取公开人物相关事实，类型限行程、言论、其他；逐个动作或言论谓词识别语法主语，事件只能归属实施动作、发表言论或承受明确事实的主体。不得归属仅被引用、作为指导思想、身份修饰或背景提及的人物；只有姓名命中不得输出其他事件。同一人物同篇材料已有言论时不要再输出其他。地点应从事件句及相邻句明确公开的场所中提取。未知字段必须为空，证据必须逐字来自正文。",
         "persons": [{"id": p["id"], "name": p["name"], "aliases": p.get("aliases", [])} for p in persons],
         "document": {"title": document["title"], "published_at": document.get("published_at"), "content": document["content_text"][:12000]},
-        "output": "JSON object with events array; fields: person_id,event_type,title,summary,start_at,location_name,confirmation_status,confidence,quote_text,evidence_text",
+        "output": "JSON object with events array; fields: person_id,event_type,title,summary,location_name,confirmation_status,confidence,quote_text,evidence_text. start_at is filled by the system from the article's published_at and must not be returned.",
     }
     body = json.dumps({
         "model": config.get("model"), "temperature": 0,
@@ -386,10 +379,19 @@ def _external_extract_with_stats(
         if not item.get("location_name"):
             segment_index = next((index for index, segment in enumerate(segments) if evidence in segment or segment in evidence), -1)
             item["location_name"] = _nearby_location(segments, segment_index) if segment_index >= 0 else ""
-        if item.get("event_type") == "other" and not item.get("start_at"):
-            item["start_at"] = _iso_date("", document.get("published_at"))
+        # start_at is sourced exclusively from the article's publication time
+        # so the three extraction paths (local, external, local fallback) stay
+        # in lockstep and the model cannot introduce a body-text date.
+        item["start_at"] = _publish_time(document.get("published_at"))
+        item["time_precision"] = "day" if item["start_at"] else "unknown"
+        # Enforce the same confirmation rule as the local path: publish time is
+        # always in the past, so the base status is "completed", with the rumor
+        # keyword override applied on the evidence text.
+        confirmation = "completed" if item["start_at"] and item["start_at"] <= datetime.now(timezone.utc).isoformat() else "expected"
+        if any(word in evidence for word in ("据称", "可能", "预计", "传闻", "或将")):
+            confirmation = "rumored" if "传闻" in evidence or "据称" in evidence else "expected"
+        item["confirmation_status"] = confirmation
         item["review_status"] = "approved"
-        item.setdefault("time_precision", "day" if item.get("start_at") else "unknown")
         item.setdefault("location_precision", "city" if item.get("location_name") else "unknown")
         item.setdefault("end_at", None)
         item.setdefault("original_timezone", "")
