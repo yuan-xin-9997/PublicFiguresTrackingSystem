@@ -24,4 +24,4 @@
 
 - [x] 4.1 更新需求规格说明书 `FR-AI-002A` / 设计说明书 §8.2 关于 `published_at` 提取口径
 - [x] 4.2 更新 README.md
-- [ ] 4.3 提交 Github 后手动触发 Jenkins，V11 迁移在启动时重置被污染文档；验证事件 1848 `start_at` 变为 `2026-08-02T16:00:00+00:00`
+- [x] 4.3 提交 Github 后手动触发 Jenkins，V11 迁移在启动时重置被污染文档；验证事件 1848 `start_at` 变为 `2026-08-02T16:00:00+00:00` -- Jenkins #41 (commit aaa7bf8) SUCCESS；V11 审计日志「重置 41 篇文档 published_at；重算 30 条事件 start_at」；事件 1848 `start_at=2026-08-02T16:00:00+00:00` 已验证
