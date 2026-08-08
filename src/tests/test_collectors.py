@@ -16,9 +16,28 @@ def test_canonicalize_url_collapses_gov_traditional_gateway():
     assert value == "https://www.gov.cn/yaowen/content_1.htm"
 
 
-def test_infer_published_at_from_chinese_body_then_url():
+def test_infer_published_at_url_path_takes_priority_over_body():
+    # Body date still used when the URL has no date path.
     assert infer_published_at("https://example.com/a", "2026年06月17日12:17 | 来源：新华社") == "2026-06-17T12:17:00+08:00"
+    # URL date path wins over the body date (URL is the CMS publish-day marker).
     assert infer_published_at("http://people.com.cn/n1/2026/0513/c1.html", "无日期") == "2026-05-13T00:00:00+08:00"
+    # news.cn 8-digit path: the URL day (08-03) wins over the body's effective
+    # date (10-15), which used to pollute published_at.
+    body = "新华社北京8月3日电 李强签署国务院令，自2026年10月15日起施行。"
+    assert infer_published_at("https://www.news.cn/politics/leaders/20260803/c.html", body) == "2026-08-03T00:00:00+08:00"
+    # Other URL date path formats.
+    assert infer_published_at("https://example.com/2026/08/03/post", "无日期") == "2026-08-03T00:00:00+08:00"
+    assert infer_published_at("https://example.com/2026/0803/post", "无日期") == "2026-08-03T00:00:00+08:00"
+
+
+def test_infer_published_at_skips_body_effective_date_when_no_url_date():
+    # No URL date path: a body effective date must be skipped (returns None),
+    # not mistaken for the publish date.
+    assert infer_published_at("https://example.com/post", "自2026年10月15日起施行。") is None
+    # A normal body date is still used as a fallback.
+    assert infer_published_at("https://example.com/post", "新华社北京2026年8月3日电 发稿。") == "2026-08-03T00:00:00+08:00"
+    # "将于" prefix also marks a future date to skip.
+    assert infer_published_at("https://example.com/post", "李强将于2026年10月15日出席。") is None
 
 
 def test_people_article_content_removes_navigation_and_footer():

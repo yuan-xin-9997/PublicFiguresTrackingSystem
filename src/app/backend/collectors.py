@@ -17,6 +17,18 @@ PUBLISHED_DATE_PATTERNS = (
     re.compile(r"(?P<y>20\d{2})年(?P<m>\d{1,2})月(?P<d>\d{1,2})日(?:\s*(?P<h>\d{1,2}):(?P<minute>\d{2}))?"),
     re.compile(r"(?P<y>20\d{2})[-/.](?P<m>\d{1,2})[-/.](?P<d>\d{1,2})(?:[ T](?P<h>\d{1,2}):(?P<minute>\d{2}))?"),
 )
+# URL 发布日期路径是 CMS 发布日标记，比正文日期可靠：正文里的完整年月日可能是
+# 条例施行日、会议日等非发布日期。支持 /20260803/、/2026/0803/、/2026/08/03/。
+_URL_DATE_PATTERNS = (
+    re.compile(r"/(20\d{2})(\d{2})(\d{2})(?:/|$)"),
+    re.compile(r"/(20\d{2})/(\d{2})/(\d{2})(?:/|$)"),
+    re.compile(r"/(20\d{2})/(\d{2})(\d{2})(?:/|$)"),
+)
+# 标记正文日期属于"未来施行/生效"而非发布日期的上下文词。
+_FUTURE_DATE_SUFFIX_MARKERS = (
+    "起施行", "起生效", "起执行", "起实施", "起公布", "起试行", "正式施行", "正式实施", "之日起",
+)
+_FUTURE_DATE_PREFIX_MARKERS = ("将于", "预计", "拟于", "计划于")
 ARTICLE_END_MARKERS = (
     "(责编：", "（责编：", "责任编辑：", "编辑：", "分享让更多人看到", "客户端下载",
     "相关阅读", "相关新闻", "推荐阅读", "更多精彩内容", "版权声明", "免责声明", "违法和不良信息举报",
@@ -92,18 +104,38 @@ def canonicalize_url(value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), clean_path, urllib.parse.urlencode(query), ""))
 
 
+def _is_future_context_date(text: str, start: int, end: int) -> bool:
+    """Return True if a date match at text[start:end] is a future
+    implementation/effective date rather than the article publish date."""
+    after = text[end:end + 10]
+    if any(marker in after for marker in _FUTURE_DATE_SUFFIX_MARKERS):
+        return True
+    before = text[max(0, start - 8):start]
+    return any(marker in before for marker in _FUTURE_DATE_PREFIX_MARKERS)
+
+
 def infer_published_at(url: str, text: str) -> Optional[str]:
+    # URL 发布日期路径优先：它是 CMS 发布日标记，比正文日期可靠。正文里的
+    # 完整年月日可能是条例施行日、会议日等非发布日期。
+    path = urllib.parse.urlsplit(url).path
+    for pattern in _URL_DATE_PATTERNS:
+        if match := pattern.search(path):
+            year, month, day = match.groups()
+            month_i, day_i = int(month), int(day)
+            if 1 <= month_i <= 12 and 1 <= day_i <= 31:
+                return "{}-{}-{}T00:00:00+08:00".format(year, month, day)
+    # 回退到正文前 5000 字的完整年月日，但跳过施行/生效/未来语境的日期，
+    # 以免把"自 2026 年 10 月 15 日起施行"当成发布日期。
+    window = text[:5000]
     for pattern in PUBLISHED_DATE_PATTERNS:
-        if match := pattern.search(text[:5000]):
+        for match in pattern.finditer(window):
+            if _is_future_context_date(window, match.start(), match.end()):
+                continue
             values = match.groupdict()
             return "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:00+08:00".format(
                 int(values["y"]), int(values["m"]), int(values["d"]),
                 int(values.get("h") or 0), int(values.get("minute") or 0),
             )
-    path = urllib.parse.urlsplit(url).path
-    match = re.search(r"/(20\d{2})/(\d{2})(\d{2})(?:/|$)", path)
-    if match:
-        return "{}-{}-{}T00:00:00+08:00".format(*match.groups())
     return None
 
 

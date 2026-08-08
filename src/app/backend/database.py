@@ -572,6 +572,16 @@ class Database:
                 connection.execute(
                     "INSERT INTO schema_version(version, applied_at) VALUES(10, datetime('now'))"
                 )
+            if not connection.execute("SELECT 1 FROM schema_version WHERE version=11").fetchone():
+                # Re-source raw_documents.published_at from the URL publish-date
+                # path when it was wrongly inferred from a body date (e.g. a
+                # regulation effective date). Then recompute start_at/dedup_key
+                # for affected non-locked events. V10 already aligned start_at to
+                # published_at, so this fixes the upstream field V10 trusted.
+                migrate_published_at_to_url_date(connection)
+                connection.execute(
+                    "INSERT INTO schema_version(version, applied_at) VALUES(11, datetime('now'))"
+                )
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -727,6 +737,177 @@ def migrate_event_time_to_publish_time(connection: sqlite3.Connection) -> Dict[s
         (
             "修复 {} 条 start_at；跳过 {} 条人工锁定；删除 {} 条重复。".format(
                 counts["repaired"], counts["skipped_locked"], counts["deleted_duplicates"]
+            ),
+        ),
+    )
+    return counts
+
+
+def migrate_published_at_to_url_date(connection: sqlite3.Connection) -> Dict[str, int]:
+    """One-shot migration (schema_version 11): repair ``raw_documents.published_at``
+    that was wrongly inferred from a body-text date (e.g. a regulation's
+    effective date "自 2026 年 10 月 15 日起施行") by re-sourcing it from the
+    URL publish-date path, which is the CMS publication-day marker.
+
+    A document is reset when its URL contains a publish-date path
+    (``/20260803/``, ``/2026/0803/`` or ``/2026/08/03/``) whose Beijing calendar
+    day differs from the current ``published_at`` day and is not later than the
+    ``collected_at`` day (a publish date cannot be after the collection date).
+
+    After resetting documents, ``start_at`` and ``dedup_key`` are recomputed for
+    affected ``human_locked=0`` events via ``extractor._publish_time`` and
+    ``extractor.event_dedup_key``. Collisions are resolved with the same policy
+    as the V10 migration: locked and out-of-set events are protected, the
+    lowest-id survivor wins within a group, and a group whose new key clashes
+    with a protected key is dropped entirely. Human-locked events are never
+    modified or deleted.
+
+    Idempotent: re-running on a repaired database finds no documents whose URL
+    day differs from ``published_at``, so it makes no further changes.
+    """
+    from app.backend.collectors import infer_published_at
+    from app.backend.extractor import _publish_time, event_dedup_key
+    from datetime import datetime, timedelta, timezone
+
+    beijing = timezone(timedelta(hours=8))
+
+    def _beijing_day(iso: Optional[str]) -> Optional[str]:
+        pt = _publish_time(iso)
+        if not pt:
+            return None
+        return datetime.fromisoformat(pt).astimezone(beijing).strftime("%Y-%m-%d")
+
+    counts: Dict[str, int] = {
+        "repaired_documents": 0, "repaired_events": 0,
+        "skipped_locked": 0, "deleted_duplicates": 0,
+    }
+
+    # 1. Find polluted documents (URL publish-day path disagrees with published_at).
+    docs = connection.execute(
+        "SELECT id, canonical_url, published_at, collected_at FROM raw_documents"
+    ).fetchall()
+    resets: List[Dict[str, Any]] = []
+    reset_doc_ids: Set[int] = set()
+    for doc in docs:
+        # Empty text -> infer falls back to the URL path only (no body dates).
+        url_pub = infer_published_at(doc["canonical_url"], "")
+        if not url_pub:
+            continue
+        url_day = _beijing_day(url_pub)
+        old_day = _beijing_day(doc["published_at"])
+        if not url_day or url_day == old_day:
+            continue
+        coll_day = _beijing_day(doc["collected_at"])
+        if coll_day and url_day > coll_day:
+            # URL date is after collection: not a publish date, leave alone.
+            continue
+        resets.append({"id": doc["id"], "new_pub": url_pub})
+        reset_doc_ids.add(int(doc["id"]))
+
+    counts["skipped_locked"] = int(
+        connection.execute("SELECT COUNT(*) FROM timeline_events WHERE human_locked = 1").fetchone()[0]
+    )
+
+    if not resets:
+        connection.execute(
+            "INSERT INTO audit_logs(actor_id,action,object_type,result,change_summary,created_at) "
+            "VALUES(NULL,'migrate_published_at_to_url','raw_documents','success',?,datetime('now'))",
+            ("无需重置 published_at；跳过 {} 条人工锁定。".format(counts["skipped_locked"]),),
+        )
+        return counts
+
+    # 2. Reset published_at on polluted documents.
+    connection.executemany(
+        "UPDATE raw_documents SET published_at = ? WHERE id = ?",
+        [(r["new_pub"], r["id"]) for r in resets],
+    )
+    counts["repaired_documents"] = len(resets)
+
+    # 3. Recompute start_at/dedup_key for affected non-locked events.
+    placeholders = ",".join("?" * len(reset_doc_ids))
+    repair_rows = connection.execute(
+        """
+        SELECT te.id AS id, te.person_id AS person_id, te.event_type AS event_type,
+               te.dedup_key AS old_key, te.start_at AS old_start, te.title AS title,
+               (SELECT ee.evidence_text FROM event_evidence ee
+                WHERE ee.event_id = te.id ORDER BY ee.id LIMIT 1) AS evidence_text,
+               (SELECT d.published_at FROM event_evidence ev
+                JOIN raw_documents d ON d.id = ev.document_id
+                WHERE ev.event_id = te.id
+                ORDER BY COALESCE(d.published_at, d.collected_at), d.id LIMIT 1) AS doc_time
+        FROM timeline_events te
+        WHERE te.human_locked = 0
+          AND EXISTS (
+              SELECT 1 FROM event_evidence ev
+              WHERE ev.event_id = te.id AND ev.document_id IN ({})
+          )
+        """.format(placeholders),
+        tuple(reset_doc_ids),
+    ).fetchall()
+
+    proposed: List[Dict[str, Any]] = []
+    by_new_key: Dict[str, List[int]] = {}
+    for row in repair_rows:
+        new_start = _publish_time(row["doc_time"])
+        if not new_start:
+            continue
+        text = row["evidence_text"] or row["title"] or ""
+        new_key = event_dedup_key(row["person_id"], row["event_type"], new_start, text)
+        if row["old_key"] == new_key and row["old_start"] == new_start:
+            continue
+        proposed.append({"id": row["id"], "new_start": new_start, "new_key": new_key})
+        by_new_key.setdefault(new_key, []).append(row["id"])
+
+    # 4. Conflict resolution (same policy as V10).
+    repair_ids = [p["id"] for p in proposed]
+    if repair_ids:
+        ph = ",".join("?" * len(repair_ids))
+        protected_rows = connection.execute(
+            f"SELECT dedup_key FROM timeline_events "
+            f"WHERE human_locked = 1 OR (human_locked = 0 AND id NOT IN ({ph}))",
+            tuple(repair_ids),
+        ).fetchall()
+    else:
+        protected_rows = connection.execute(
+            "SELECT dedup_key FROM timeline_events WHERE human_locked = 1"
+        ).fetchall()
+    protected_keys: Set[str] = {r["dedup_key"] for r in protected_rows}
+
+    to_delete: Set[int] = set()
+    survivors: List[Dict[str, Any]] = []
+    for new_key, ids in by_new_key.items():
+        ids_sorted = sorted(ids)
+        if new_key in protected_keys:
+            to_delete.update(ids_sorted)
+            continue
+        survivors.append(next(p for p in proposed if p["id"] == ids_sorted[0]))
+        to_delete.update(ids_sorted[1:])
+
+    if survivors:
+        connection.executemany(
+            "UPDATE timeline_events SET dedup_key = ? WHERE id = ?",
+            [(f"pubfix-migration-{p['id']}", p["id"]) for p in survivors],
+        )
+    if to_delete:
+        for event_id in sorted(to_delete):
+            connection.execute("DELETE FROM timeline_events WHERE id = ?", (event_id,))
+    if survivors:
+        connection.executemany(
+            "UPDATE timeline_events SET start_at = ?, dedup_key = ?, "
+            "time_precision = 'day', original_timezone = 'Asia/Shanghai' WHERE id = ?",
+            [(p["new_start"], p["new_key"], p["id"]) for p in survivors],
+        )
+
+    counts["repaired_events"] = len(survivors)
+    counts["deleted_duplicates"] = len(to_delete)
+    connection.execute(
+        "INSERT INTO audit_logs(actor_id,action,object_type,result,change_summary,created_at) "
+        "VALUES(NULL,'migrate_published_at_to_url','raw_documents','success',?,datetime('now'))",
+        (
+            "重置 {} 篇文档 published_at；重算 {} 条事件 start_at；"
+            "跳过 {} 条人工锁定；删除 {} 条重复。".format(
+                counts["repaired_documents"], counts["repaired_events"],
+                counts["skipped_locked"], counts["deleted_duplicates"],
             ),
         ),
     )

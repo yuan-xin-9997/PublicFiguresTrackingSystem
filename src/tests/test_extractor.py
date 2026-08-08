@@ -1,7 +1,7 @@
 import json
 import sqlite3
 
-from app.backend.database import SCHEMA, migrate_event_time_to_publish_time
+from app.backend.database import SCHEMA, migrate_event_time_to_publish_time, migrate_published_at_to_url_date
 from app.backend.extractor import event_dedup_key, external_extract, extract, local_extract, normalize_location
 from app.backend.services import _event_similarity
 
@@ -466,4 +466,106 @@ def test_migration_repairs_start_at_and_merges_duplicates_and_is_idempotent():
         "SELECT start_at, dedup_key FROM timeline_events WHERE id=?", (target_id,)
     ).fetchone()
     assert again[0] == "2026-08-02T16:00:00+00:00"
+    connection.close()
+
+
+def _seed_published_at_pollution_db():
+    """Simulate a document whose published_at was wrongly inferred from a body
+    effective date (10-15) while the URL publish path says 08-03, and an event
+    whose start_at was set to that polluted published_at by the V10 migration."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(SCHEMA)
+    connection.execute(
+        "INSERT INTO users(username,password_hash,role,enabled,created_at,updated_at) "
+        "VALUES('admin','x','admin',1,datetime('now'),datetime('now'))"
+    )
+    connection.execute(
+        "INSERT INTO public_figures(name,enabled,created_at,updated_at) VALUES('李强',1,datetime('now'),datetime('now'))"
+    )
+    person_id = 1
+    connection.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES('seed','rss',datetime('now'),datetime('now'))"
+    )
+    source_id = connection.execute("SELECT id FROM information_sources WHERE name='seed'").fetchone()[0]
+    # Document: polluted published_at (10-15 body effective date), URL path 20260803 (08-03).
+    connection.execute(
+        "INSERT INTO raw_documents(source_id,canonical_url,title,author,published_at,collected_at,content_text,content_hash,fetch_metadata_json) "
+        "VALUES(?, 'https://www.news.cn/politics/leaders/20260803/c.html', '李强签署国务院令', '', "
+        "'2026-10-14T16:00:00+00:00', '2026-08-03T09:45:27+00:00', '正文', 'h1','{}')",
+        (source_id,),
+    )
+    document_id = connection.execute(
+        "SELECT id FROM raw_documents WHERE canonical_url='https://www.news.cn/politics/leaders/20260803/c.html'"
+    ).fetchone()[0]
+    # Non-locked event whose start_at was set to the polluted published_at.
+    connection.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,location_name,location_precision,confirmation_status,review_status,confidence,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?, 'statement', '签署', '李强签署国务院令并表示推进。', '2026-10-14T16:00:00+00:00', NULL, 'Asia/Shanghai', 'day', '', 'unknown', 'completed', 'approved', 0.6, 'stale-pub-key', 0, datetime('now'), datetime('now'))",
+        (person_id,),
+    )
+    target_event_id = connection.execute(
+        "SELECT id FROM timeline_events WHERE dedup_key='stale-pub-key'"
+    ).fetchone()[0]
+    connection.execute(
+        "INSERT INTO event_evidence(event_id, document_id, evidence_text, supports_fields_json, source_claim_json) "
+        "VALUES(?, ?, '李强签署国务院令并表示推进。', '[]', '{}')",
+        (target_event_id, document_id),
+    )
+    # Human-locked event that must be skipped.
+    connection.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,end_at,original_timezone,time_precision,location_name,location_precision,confirmation_status,review_status,confidence,dedup_key,human_locked,created_at,updated_at) "
+        "VALUES(?, 'other', '锁定事件', '人工锁定', '2010-01-01T00:00:00+00:00', NULL, 'Asia/Shanghai', 'day', '', 'unknown', 'completed', 'approved', 0.5, 'locked-pub-key', 1, datetime('now'), datetime('now'))",
+        (person_id,),
+    )
+    locked_event_id = connection.execute(
+        "SELECT id FROM timeline_events WHERE dedup_key='locked-pub-key'"
+    ).fetchone()[0]
+    return connection, document_id, target_event_id, locked_event_id
+
+
+def test_migration_resets_polluted_published_at_and_recomputes_events():
+    connection, document_id, target_id, locked_id = _seed_published_at_pollution_db()
+    counts = migrate_published_at_to_url_date(connection)
+    assert counts["repaired_documents"] == 1
+    assert counts["repaired_events"] == 1
+    assert counts["skipped_locked"] == 1
+
+    # Document published_at reset to the URL publish day (08-03 Beijing).
+    doc = connection.execute(
+        "SELECT published_at FROM raw_documents WHERE id=?", (document_id,)
+    ).fetchone()
+    assert doc["published_at"] == "2026-08-03T00:00:00+08:00"
+
+    # Event start_at recomputed from the corrected published_at.
+    row = connection.execute(
+        "SELECT start_at, time_precision, dedup_key, human_locked FROM timeline_events WHERE id=?",
+        (target_id,),
+    ).fetchone()
+    assert row["start_at"] == "2026-08-02T16:00:00+00:00"
+    assert row["time_precision"] == "day"
+    assert row["dedup_key"] != "stale-pub-key"
+    assert row["human_locked"] == 0
+
+    # Locked event untouched.
+    locked = connection.execute(
+        "SELECT start_at, dedup_key, human_locked FROM timeline_events WHERE id=?", (locked_id,)
+    ).fetchone()
+    assert locked["start_at"] == "2010-01-01T00:00:00+00:00"
+    assert locked["dedup_key"] == "locked-pub-key"
+
+    # Audit row written.
+    assert connection.execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action='migrate_published_at_to_url'"
+    ).fetchone()[0] == 1
+
+    # Idempotent: a second pass produces no further changes.
+    second = migrate_published_at_to_url_date(connection)
+    assert second["repaired_documents"] == 0
+    assert second["repaired_events"] == 0
+    doc2 = connection.execute(
+        "SELECT published_at FROM raw_documents WHERE id=?", (document_id,)
+    ).fetchone()
+    assert doc2["published_at"] == "2026-08-03T00:00:00+08:00"
     connection.close()

@@ -39,7 +39,7 @@
 
 ## 6. 文档与交付
 
-- [ ] 6.1 更新需求规格说明书、设计说明书中事件时间相关章节
-- [ ] 6.2 更新 `README.md`：补充事件发生时间取文章发布时间的口径说明
-- [ ] 6.3 检查 `JenkinsConfig/Jenkinsfile` 是否需调整（部署前备份 `data/app.sqlite3` 的提示等）
-- [ ] 6.4 提交 Github 后手动触发 Jenkins 手工构建，提示用户访问构建后服务验证（重点核验「李强签署国务院令」类事件时间已改为发布时间）
+- [x] 6.1 更新需求规格说明书、设计说明书中事件时间相关章节
+- [x] 6.2 更新 `README.md`：补充事件发生时间取文章发布时间的口径说明
+- [x] 6.3 检查 `JenkinsConfig/Jenkinsfile` 是否需调整（部署前备份 `data/app.sqlite3` 的提示等）—— 已使用 `--exclude data --exclude config/app.json`，V10 迁移在进程内执行；无需改动
+- [x] 6.4 提交 Github 后手动触发 Jenkins 手工构建，提示用户访问构建后服务验证（重点核验「李强签署国务院令」类事件时间已改为发布时间）—— commit d2eb520 已推送到 origin/main
