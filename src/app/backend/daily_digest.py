@@ -594,12 +594,24 @@ def digest_batch_rows(
         "COALESCE((SELECT GROUP_CONCAT(DISTINCT s.name) FROM event_evidence ev "
         "JOIN raw_documents d ON d.id=ev.document_id "
         "JOIN information_sources s ON s.id=d.source_id "
-        "WHERE ev.event_id=e.id),'') AS source_names "
+        "WHERE ev.event_id=e.id),'') AS source_names,"
+        "COALESCE((SELECT GROUP_CONCAT(d2.canonical_url, ' | ') FROM event_evidence ev2 "
+        "JOIN raw_documents d2 ON d2.id=ev2.document_id "
+        "WHERE ev2.event_id=e.id AND d2.canonical_url<>''),'') AS source_urls_raw "
         "FROM daily_digest_items i LEFT JOIN timeline_events e ON e.id=i.event_id "
         "LEFT JOIN public_figures p ON p.id=e.person_id WHERE i.batch_id=? "
         "ORDER BY e.start_at IS NULL,e.start_at,p.id,e.event_type,e.id",
         (batch_id,),
     )
+    for row in rows:
+        urls = []
+        seen = set()
+        for part in str(row.pop("source_urls_raw", "")).split("|"):
+            url = part.strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        row["source_urls"] = " | ".join(urls)
     return batch, rows
 
 
@@ -612,6 +624,26 @@ def _beijing(value: Optional[str]) -> str:
         ).strftime("%Y-%m-%d %H:%M")
     except (TypeError, ValueError):
         return str(value)
+
+
+def _source_url_list(value: str) -> List[str]:
+    return [part.strip() for part in str(value or "").split("|") if part.strip()]
+
+
+def _source_url_line(value: str) -> str:
+    urls = _source_url_list(value)
+    return "来源链接：{}".format(", ".join(urls)) if urls else ""
+
+
+def _source_url_html(value: str) -> str:
+    urls = _source_url_list(value)
+    if not urls:
+        return ""
+    parts = [
+        '<a href="{}">{}</a>'.format(html.escape(url, quote=True), html.escape(url))
+        for url in urls
+    ]
+    return '<br>来源链接：{}'.format(" | ".join(parts))
 
 
 def build_digest_message(
@@ -644,6 +676,7 @@ def build_digest_message(
         html_parts.append("<p>本期没有符合规则的公开动态。</p>")
     for index, event in enumerate(deliverable, 1):
         link = urljoin(base_url, "?event_id={}".format(event["event_id"])) if base_url != "/" else ""
+        url_line = _source_url_line(event.get("source_urls", ""))
         facts = [
             "{}. [{}] {} · {}".format(
                 index, labels.get(event["event_type"], event["event_type"]),
@@ -653,11 +686,14 @@ def build_digest_message(
             "地点：{}".format(event["location_name"] or "未披露"),
             "状态：{} / {}".format(event["confirmation_status"], event["review_status"]),
             "来源：{}".format(event["source_names"] or "来源未知"),
-            str(event["summary"] or ""),
         ]
+        if url_line:
+            facts.append(url_line)
+        facts.append(str(event["summary"] or ""))
         if link:
             facts.append("详情：{}".format(link))
         plain_parts.append("\n".join(facts))
+        url_html = _source_url_html(event.get("source_urls", ""))
         html_parts.append(
             "<article><h3>{}. [{}] {} · {}</h3><p>{}</p><p>时间：{}（北京时间）<br>"
             "地点：{}<br>状态：{} / {}<br>来源：{}{}</p></article>".format(
@@ -670,7 +706,10 @@ def build_digest_message(
                 html.escape(str(event["confirmation_status"])),
                 html.escape(str(event["review_status"])),
                 html.escape(str(event["source_names"] or "来源未知")),
-                '<br><a href="{}">查看详情</a>'.format(html.escape(link, quote=True)) if link else "",
+                "{}{}".format(
+                    url_html,
+                    '<br><a href="{}">查看详情</a>'.format(html.escape(link, quote=True)) if link else "",
+                ),
             )
         )
     message = EmailMessage()

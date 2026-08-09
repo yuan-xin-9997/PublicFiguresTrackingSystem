@@ -297,6 +297,116 @@ def test_digest_message_worker_success_empty_and_retry(configured_app, monkeypat
     )["status"] == "retrying"
 
 
+def test_digest_message_includes_canonical_source_urls(configured_app, monkeypatch):
+    db = configured_app.state.db
+    settings = configured_app.state.settings
+    db.initialize()
+    now = utc_now()
+    person_id = db.execute(
+        "INSERT INTO public_figures(name,created_at,updated_at) VALUES(?,?,?)",
+        ("日报链接人物", now, now),
+    )
+    source_id = db.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES(?,?,?,?)",
+        ("日报链接来源", "manual", now, now),
+    )
+
+    def insert_doc(canonical_url, hash_value):
+        return db.execute(
+            "INSERT INTO raw_documents(source_id,canonical_url,title,collected_at,"
+            "content_text,content_hash) VALUES(?,?,?,?,?,?)",
+            (source_id, canonical_url, "doc-{}".format(hash_value), now, "x", hash_value),
+        )
+
+    first_doc = insert_doc("https://daily.example.com/first", "daily-hash-1")
+    second_doc = insert_doc("https://daily.example.com/second", "daily-hash-2")
+
+    event_id = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,"
+        "location_name,confirmation_status,review_status,dedup_key,created_at,updated_at) "
+        "VALUES(?, 'itinerary', ?, ?, ?, ?, 'confirmed', 'approved', ?, ?, ?)",
+        (
+            person_id, "带链接日报事件", "摘要",
+            "2026-08-08T05:00:00+00:00", "北京",
+            "daily-url-event", now, now,
+        ),
+    )
+    # Two evidence rows on the first document with different evidence_text exercise
+    # the dedupe branch in digest_batch_rows.
+    for document_id, evidence_text in (
+        (first_doc, "证据-日报片段一"),
+        (first_doc, "证据-日报片段二"),
+        (second_doc, "证据-日报片段三"),
+    ):
+        db.execute(
+            "INSERT INTO event_evidence(event_id,document_id,evidence_text,evidence_locator) "
+            "VALUES(?,?,?,?)",
+            (event_id, document_id, evidence_text, "正文"),
+        )
+
+    _enable_email(settings, db, monkeypatch)
+    rule = save_digest_rule(
+        db, settings, "链接日报", [person_id], ["itinerary", "statement"],
+        ["me@example.com"], send_time="08:30",
+    )
+    db.execute(
+        "UPDATE daily_digest_rules SET enabled_at=? WHERE id=?",
+        ("2026-07-01T00:00:00+00:00", rule["id"]),
+    )
+    run = create_digest_run(db, settings, rule["id"], date(2026, 8, 9), "manual")
+    batch = db.fetch_one(
+        "SELECT * FROM daily_digest_batches WHERE run_id=?", (run["id"],)
+    )
+    email_config = {
+        **settings.get("notifications", "email"),
+        "from_address": "sender@example.com",
+        "from_name": "PFTS",
+    }
+    message, deliverable, _ = build_digest_message(db, settings, batch["id"], email_config)
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+
+    assert (
+        "来源链接：https://daily.example.com/first, https://daily.example.com/second"
+        in plain
+    )
+    assert plain.count("https://daily.example.com/first") == 1
+    assert 'href="https://daily.example.com/first"' in html_body
+    assert 'href="https://daily.example.com/second"' in html_body
+    assert html_body.count('href="https://daily.example.com/first"') == 1
+    assert deliverable
+
+
+def test_digest_message_omits_url_line_when_no_canonical_url(configured_app, monkeypatch):
+    db = configured_app.state.db
+    settings = configured_app.state.settings
+    db.initialize()
+    first_person, _, _ = _seed_digest_data(db)
+    _enable_email(settings, db, monkeypatch)
+    rule = save_digest_rule(
+        db, settings, "无链接日报", [first_person], ["itinerary", "statement"],
+        ["me@example.com"], send_time="08:30",
+    )
+    db.execute(
+        "UPDATE daily_digest_rules SET enabled_at=? WHERE id=?",
+        ("2026-07-01T00:00:00+00:00", rule["id"]),
+    )
+    run = create_digest_run(db, settings, rule["id"], date(2026, 7, 30), "manual")
+    batch = db.fetch_one(
+        "SELECT * FROM daily_digest_batches WHERE run_id=?", (run["id"],)
+    )
+    email_config = {
+        **settings.get("notifications", "email"),
+        "from_address": "sender@example.com",
+        "from_name": "PFTS",
+    }
+    message, _, _ = build_digest_message(db, settings, batch["id"], email_config)
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    assert "来源链接" not in plain
+    assert "来源链接" not in html_body
+
+
 def test_digest_rule_filters_by_information_source(configured_app):
     db = configured_app.state.db
     settings = configured_app.state.settings

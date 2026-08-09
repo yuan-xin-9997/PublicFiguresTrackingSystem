@@ -235,6 +235,105 @@ def test_message_content_and_worker_success(configured_app, monkeypatch):
     assert db.fetch_one("SELECT status FROM email_delivery_batches WHERE id=?", (batch["id"],))["status"] == "sent"
 
 
+def test_push_email_includes_canonical_source_urls(configured_app, monkeypatch):
+    db = configured_app.state.db
+    settings = configured_app.state.settings
+    db.initialize()
+    now = utc_now()
+    person_id = db.execute(
+        "INSERT INTO public_figures(name,created_at,updated_at) VALUES(?,?,?)",
+        ("链接人物", now, now),
+    )
+    source_id = db.execute(
+        "INSERT INTO information_sources(name,type,created_at,updated_at) VALUES(?,?,?,?)",
+        ("链接来源", "manual", now, now),
+    )
+    task_id = db.execute(
+        "INSERT INTO collection_tasks(name,source_id,created_at,updated_at) VALUES(?,?,?,?)",
+        ("链接采集", source_id, now, now),
+    )
+    run_id = db.execute(
+        "INSERT INTO task_runs(task_id,status,started_at,finished_at,correlation_id) "
+        "VALUES(?, 'success', ?, ?, ?)",
+        (task_id, now, now, "url-test-run"),
+    )
+
+    def insert_doc(canonical_url, hash_value):
+        return db.execute(
+            "INSERT INTO raw_documents(source_id,canonical_url,title,collected_at,"
+            "content_text,content_hash) VALUES(?,?,?,?,?,?)",
+            (source_id, canonical_url, "doc-{}".format(hash_value), now, "x", hash_value),
+        )
+
+    first_doc = insert_doc("https://news.example.com/first", "hash-first")
+    second_doc = insert_doc("https://news.example.com/second", "hash-second")
+
+    event_id = db.execute(
+        "INSERT INTO timeline_events(person_id,event_type,title,summary,start_at,location_name,"
+        "confirmation_status,review_status,dedup_key,created_at,updated_at) "
+        "VALUES(?,'itinerary',?,?,?,?,?,'approved',?,?,?)",
+        (
+            person_id, "带链接事件", "正文摘要",
+            "2026-08-09T02:00:00+00:00", "北京", "confirmed",
+            "url-test-event", now, now,
+        ),
+    )
+    db.execute(
+        "INSERT INTO task_run_events(run_id,event_id,created_at) VALUES(?,?,?)",
+        (run_id, event_id, now),
+    )
+    # Two evidence rows point at the same first document with different evidence_text,
+    # exercising the dedupe branch in _batch_rows.
+    for document_id, evidence_text in (
+        (first_doc, "证据-片段一"),
+        (first_doc, "证据-片段二"),
+        (second_doc, "证据-片段三"),
+    ):
+        db.execute(
+            "INSERT INTO event_evidence(event_id,document_id,evidence_text,evidence_locator) "
+            "VALUES(?,?,?,?)",
+            (event_id, document_id, evidence_text, "正文"),
+        )
+
+    _enable_email(settings, db, monkeypatch)
+    _seed_delivery_batch(db, run_id, [event_id])
+    batch = db.fetch_one("SELECT * FROM email_delivery_batches ORDER BY id")
+    config, _ = effective_email_config(settings, db, include_secret=True)
+    message, deliverable, _ = build_batch_message(db, settings, batch["id"], config)
+
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+
+    assert (
+        "来源链接：https://news.example.com/first, https://news.example.com/second"
+        in plain
+    )
+    assert plain.count("https://news.example.com/first") == 1
+    assert 'href="https://news.example.com/first"' in html_body
+    assert 'href="https://news.example.com/second"' in html_body
+    assert html_body.count('href="https://news.example.com/first"') == 1
+    assert deliverable
+
+
+def test_push_email_omits_url_line_when_no_canonical_url(configured_app, monkeypatch):
+    db = configured_app.state.db
+    settings = configured_app.state.settings
+    db.initialize()
+    _, run_id, _ = _seed_delivery_data(db, 1)
+    _enable_email(settings, db, monkeypatch)
+    event_ids = [row["event_id"] for row in db.fetch_all(
+        "SELECT event_id FROM task_run_events WHERE run_id=?", (run_id,)
+    )]
+    _seed_delivery_batch(db, run_id, event_ids)
+    batch = db.fetch_one("SELECT * FROM email_delivery_batches ORDER BY id")
+    config, _ = effective_email_config(settings, db, include_secret=True)
+    message, _, _ = build_batch_message(db, settings, batch["id"], config)
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+    assert "来源链接" not in plain
+    assert "来源链接" not in html_body
+
+
 def test_worker_retries_then_fails_without_changing_task_run(configured_app, monkeypatch):
     db = configured_app.state.db
     settings = configured_app.state.settings
