@@ -38,50 +38,59 @@ def main() -> int:
         digest_options.raise_for_status()
         assert "information_sources" in digest_options.json()
         suffix = uuid.uuid4().hex[:8]
-        person = client.post("/api/v1/persons", json={
-            "name": "冒烟测试人物-" + suffix,
-            "native_name": "",
-            "bio": "",
-            "organization": "Smoke",
-            "title": "测试",
-            "country_region": "中国",
-            "language": "zh-CN",
-            "avatar_path": "",
-            "enabled": True,
-            "aliases": [],
-        })
-        person.raise_for_status()
-        person_id = person.json()["id"]
-        source = client.post("/api/v1/sources", json={
-            "name": "冒烟人工来源-" + suffix,
-            "type": "manual",
-            "entry_url": "",
-            "organization": "Smoke",
-            "language": "zh-CN",
-            "trust_level": 4,
-            "schedule_seconds": 3600,
-            "enabled": True,
-            "person_ids": [person_id],
-        })
-        source.raise_for_status()
-        document = client.post("/api/v1/documents/manual", json={
-            "source_id": source.json()["id"],
-            "title": "冒烟测试公开行程-" + suffix,
-            "content_text": "2026年8月4日，冒烟测试人物-{}在北京出席公开测试活动。".format(suffix),
-            "canonical_url": "https://example.com/smoke/" + suffix,
-            "author": "smoke",
-            "published_at": "2026-08-04T08:00:00+08:00",
-        })
-        document.raise_for_status()
-        events = client.get("/api/v1/events", params={"person_id": person_id, "page_size": 10})
-        events.raise_for_status()
-        assert events.json()["total"] >= 1
-        event_id = events.json()["items"][0]["id"]
-        deleted = client.delete("/api/v1/events/{}".format(event_id))
-        deleted.raise_for_status()
-        after_delete = client.get("/api/v1/events/{}".format(event_id))
-        assert after_delete.status_code == 404
-        print("SMOKE_OK", ready.json()["status"], dashboard.json()["counts"])
+        person_id = None
+        source_id = None
+        try:
+            person = client.post("/api/v1/persons", json={
+                "name": "冒烟测试人物-" + suffix,
+                "native_name": "",
+                "bio": "",
+                "organization": "Smoke",
+                "title": "测试",
+                "country_region": "中国",
+                "language": "zh-CN",
+                "avatar_path": "",
+                "enabled": True,
+                "aliases": [],
+            })
+            person.raise_for_status()
+            person_id = person.json()["id"]
+            source = client.post("/api/v1/sources", json={
+                "name": "冒烟人工来源-" + suffix,
+                "type": "manual",
+                "entry_url": "",
+                "organization": "Smoke",
+                "language": "zh-CN",
+                "trust_level": 4,
+                "schedule_seconds": 3600,
+                "enabled": True,
+                "person_ids": [person_id],
+            })
+            source.raise_for_status()
+            source_id = source.json()["id"]
+            document = client.post("/api/v1/documents/manual", json={
+                "source_id": source_id,
+                "title": "冒烟测试公开行程-" + suffix,
+                "content_text": "2026年8月4日，冒烟测试人物-{}在北京出席公开测试活动。".format(suffix),
+                "canonical_url": "https://example.com/smoke/" + suffix,
+                "author": "smoke",
+                "published_at": "2026-08-04T08:00:00+08:00",
+            })
+            document.raise_for_status()
+            events = client.get("/api/v1/events", params={"person_id": person_id, "page_size": 10})
+            events.raise_for_status()
+            assert events.json()["total"] >= 1
+            event_id = events.json()["items"][0]["id"]
+            deleted = client.delete("/api/v1/events/{}".format(event_id))
+            deleted.raise_for_status()
+            after_delete = client.get("/api/v1/events/{}".format(event_id))
+            assert after_delete.status_code == 404
+            print("SMOKE_OK", ready.json()["status"], dashboard.json()["counts"])
+        finally:
+            if source_id:
+                client.delete("/api/v1/sources/{}".format(source_id))
+            if person_id:
+                client.delete("/api/v1/persons/{}".format(person_id))
     return 0
 
 

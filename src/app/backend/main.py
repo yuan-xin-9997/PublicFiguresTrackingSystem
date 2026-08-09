@@ -543,11 +543,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         total = int(db.fetch_one("SELECT COUNT(*) n FROM task_runs r " + where, params)["n"])
         params.extend([page_size, (page - 1) * page_size])
         items = db.fetch_all(
-            "SELECT r.*,t.name AS task_name,"
-            "(SELECT COUNT(*) FROM email_delivery_batches b WHERE b.task_run_id=r.id) AS notification_batches,"
-            "(SELECT COUNT(*) FROM email_delivery_items i WHERE i.task_run_id=r.id) AS notification_items,"
-            "COALESCE((SELECT b.last_error FROM email_delivery_batches b WHERE b.task_run_id=r.id "
-            "AND b.status='failed' ORDER BY b.id DESC LIMIT 1),'') AS notification_error "
+            "SELECT r.*,t.name AS task_name "
             "FROM task_runs r JOIN collection_tasks t ON t.id=r.task_id " + where + " ORDER BY r.id DESC LIMIT ? OFFSET ?", params
         )
         return _list_response(items, total, page, page_size)
@@ -779,10 +775,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @application.get("/api/v1/notifications/options")
     def notification_options(user: Dict[str, Any] = Depends(require_page("notifications"))):
         return {
-            "tasks": db.fetch_all(
-                "SELECT t.id,t.name,t.enabled,s.name AS source_name FROM collection_tasks t "
-                "JOIN information_sources s ON s.id=t.source_id ORDER BY t.id"
-            ),
             "persons": db.fetch_all(
                 "SELECT id,name,organization,title FROM public_figures "
                 "WHERE enabled=1 AND deleted_at IS NULL ORDER BY name,id"
@@ -1042,81 +1034,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         return db.fetch_one(
             "SELECT * FROM daily_digest_batches WHERE id=?", (batch_id,)
         )
-
-    @application.get("/api/v1/notifications/deliveries")
-    def notification_deliveries(
-        page: int = Query(1, ge=1),
-        page_size: int = Query(20, ge=1, le=200),
-        task_id: Optional[int] = None,
-        delivery_status: str = "",
-        user: Dict[str, Any] = Depends(require_page("notifications")),
-    ):
-        clauses = []
-        params: List[Any] = []
-        if task_id is not None:
-            clauses.append("r.task_id=?")
-            params.append(task_id)
-        if delivery_status:
-            if delivery_status not in {"pending", "sending", "retrying", "sent", "failed", "skipped"}:
-                raise HTTPException(422, "投递状态无效")
-            clauses.append("b.status=?")
-            params.append(delivery_status)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        base = (
-            " FROM email_delivery_batches b JOIN task_runs r ON r.id=b.task_run_id "
-            "JOIN collection_tasks t ON t.id=r.task_id "
-        )
-        total = int(db.fetch_one("SELECT COUNT(*) n" + base + where, params)["n"])
-        items = db.fetch_all(
-            "SELECT b.*,r.task_id,t.name AS task_name,"
-            "(SELECT COUNT(*) FROM email_delivery_items i WHERE i.batch_id=b.id) AS item_count"
-            + base + where + " ORDER BY b.id DESC LIMIT ? OFFSET ?",
-            params + [page_size, (page - 1) * page_size],
-        )
-        return _list_response(items, total, page, page_size)
-
-    @application.get("/api/v1/notifications/deliveries/{batch_id}")
-    def notification_delivery_detail(
-        batch_id: int,
-        user: Dict[str, Any] = Depends(require_page("notifications")),
-    ):
-        batch = db.fetch_one(
-            "SELECT b.*,r.task_id,t.name AS task_name FROM email_delivery_batches b "
-            "JOIN task_runs r ON r.id=b.task_run_id JOIN collection_tasks t ON t.id=r.task_id WHERE b.id=?",
-            (batch_id,),
-        )
-        if not batch:
-            raise HTTPException(404, "投递批次不存在")
-        batch["items"] = db.fetch_all(
-            "SELECT i.*,e.title,e.event_type,p.name AS person_name FROM email_delivery_items i "
-            "LEFT JOIN timeline_events e ON e.id=i.event_id LEFT JOIN public_figures p ON p.id=e.person_id "
-            "WHERE i.batch_id=? ORDER BY i.id",
-            (batch_id,),
-        )
-        return batch
-
-    @application.post("/api/v1/notifications/deliveries/{batch_id}/retry")
-    def retry_notification_delivery(
-        batch_id: int,
-        request: Request,
-        user: Dict[str, Any] = Depends(require_admin),
-    ):
-        batch = db.fetch_one("SELECT id,status FROM email_delivery_batches WHERE id=?", (batch_id,))
-        if not batch:
-            raise HTTPException(404, "投递批次不存在")
-        if batch["status"] != "failed":
-            raise HTTPException(409, "只有失败批次可以手工重试")
-        now = utc_now()
-        db.execute(
-            "UPDATE email_delivery_batches SET status='retrying',attempt_count=0,next_attempt_at=?,"
-            "last_error='',updated_at=? WHERE id=?",
-            (now, now, batch_id),
-        )
-        audit(
-            db, "retry", "email_delivery_batch", batch_id, user["id"],
-            ip_address=_client_ip(request), summary="手工重试失败邮件批次",
-        )
-        return db.fetch_one("SELECT * FROM email_delivery_batches WHERE id=?", (batch_id,))
 
     @application.get("/api/v1/map/config")
     def map_config(user: Dict[str, Any] = Depends(require_page("map"))):

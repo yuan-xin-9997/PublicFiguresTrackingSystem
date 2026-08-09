@@ -338,9 +338,7 @@ def test_notification_api_permissions_rules_and_audit(admin_client, configured_a
     )["id"]
     options = admin_client.get("/api/v1/notifications/options")
     assert options.status_code == 200
-    assert options.json()["tasks"] == [{
-        "id": task_id, "name": "测试采集", "enabled": 1, "source_name": "测试来源",
-    }]
+    assert "tasks" not in options.json()
     assert options.json()["persons"] == [{
         "id": person_id, "name": "测试人物", "organization": "", "title": "",
     }]

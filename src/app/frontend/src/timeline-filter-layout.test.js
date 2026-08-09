@@ -25,6 +25,14 @@ describe('timeline filter layout contract', () => {
     expect(mainSource).toContain('删除事件')
   })
 
+  it('includes pagination controls for the timeline', () => {
+    expect(mainSource).toContain('class="pagination"')
+    expect(mainSource).toContain('goToPage')
+    expect(mainSource).toContain('pageSize')
+    expect(mainSource).toContain('totalPages')
+    expect(mainSource).not.toContain('percent(event.confidence)')
+  })
+
   it('keeps collapsed toolbar controls at one shared height', () => {
     expect(stylesSource).toMatch(
       /\.toolbar > input,\s*\.toolbar > select,\s*\.toolbar > button,\s*\.location-filter > summary\s*\{\s*min-height:\s*43px;\s*height:\s*43px;/

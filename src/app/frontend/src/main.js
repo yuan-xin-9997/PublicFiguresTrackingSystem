@@ -3,7 +3,7 @@
 import { computed, createApp, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue/dist/vue.esm-bundler.js'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { eventLabels, formatBeijing, locationFilterLabel, percent, queryString, statusLabels } from './utils.js'
+import { eventLabels, formatBeijing, locationFilterLabel, queryString, statusLabels } from './utils.js'
 import './styles.css'
 
 const API = '/api/v1'
@@ -33,8 +33,7 @@ const App = {
     const data = reactive({
       dashboard: null, persons: [], sources: [], tasks: [], runs: [], events: [], eventTotal: 0,
       selectedEvent: null, users: [], allPages: [], config: null, audit: [], search: [], documents: [], mapPeople: [], locations: [],
-      notificationConfig: null, notificationOptions: { tasks: [], persons: [], event_types: [] },
-      deliveries: [], deliveryTotal: 0, selectedDelivery: null,
+      notificationConfig: null, notificationOptions: { persons: [], event_types: [] },
       digestConfig: null, digestRules: [], digestRuns: [],
       digestOptions: { persons: [], event_types: [], information_sources: [], defaults: {} },
       digestPreview: null, selectedDigestRun: null
@@ -70,10 +69,11 @@ const App = {
     const digestSourceSearch = ref('')
     const digestPreviewDate = ref('')
     const digestRunFilters = reactive({ rule_id: '', run_status: '' })
-    const deliveryFilters = reactive({ task_id: '', delivery_status: '' })
     const searchTerm = ref('')
     const mapEl = ref(null)
     const mapPersonId = ref('')
+    const page = ref(1)
+    const pageSize = ref(20)
     let leafletMap = null
 
     const nav = [
@@ -102,6 +102,7 @@ const App = {
         )
       )
     })
+    const totalPages = computed(() => Math.max(1, Math.ceil(data.eventTotal / pageSize.value)))
 
     function flash(message) {
       notice.value = message
@@ -155,7 +156,7 @@ const App = {
         else if (['timeline', 'map'].includes(active.value)) {
           if (!data.persons.length && user.value.pages.includes('persons')) data.persons = (await api('/persons')).items
           if (active.value === 'timeline' && !data.locations.length) data.locations = (await api('/events/locations')).items
-          const params = active.value === 'map' ? { page_size: 100, event_type: 'itinerary', person_id: mapPersonId.value } : { page_size: 100, ...filters }
+          const params = active.value === 'map' ? { page_size: 100, event_type: 'itinerary', person_id: mapPersonId.value } : { page: page.value, page_size: pageSize.value, ...filters }
           const result = await api(`/events?${queryString(params)}`)
           data.events = result.items; data.eventTotal = result.total
         } else if (active.value === 'persons') data.persons = (await api(`/persons?${queryString({ q: filters.q })}`)).items
@@ -168,17 +169,14 @@ const App = {
           }
           if (user.value.role === 'admin') await loadCommon()
         } else if (active.value === 'notifications') {
-          const [configResult, optionsResult, deliveriesResult, digestConfigResult, digestRulesResult, digestOptionsResult, digestRunsResult] = await Promise.all([
+          const [configResult, optionsResult, digestConfigResult, digestRulesResult, digestOptionsResult, digestRunsResult] = await Promise.all([
             api('/notifications/email/config'), api('/notifications/options'),
-            api(`/notifications/deliveries?${queryString({ page_size: 50, ...deliveryFilters })}`),
             api('/notifications/digests/config'), api('/notifications/digests/rules'),
             api('/notifications/digests/options'),
             api(`/notifications/digests/runs?${queryString({ page_size: 50, ...digestRunFilters })}`)
           ])
           data.notificationConfig = configResult
           data.notificationOptions = optionsResult
-          data.deliveries = deliveriesResult.items
-          data.deliveryTotal = deliveriesResult.total
           data.digestConfig = digestConfigResult
           data.digestRules = digestRulesResult.items
           data.digestOptions = digestOptionsResult
@@ -235,6 +233,11 @@ const App = {
       active.value = key; data.selectedEvent = null
       if (key === 'map') data.mapPeople = (await api('/map/people')).items
       await loadPage(); if (key === 'map') await renderMap()
+    }
+    function goToPage(targetPage) {
+      if (targetPage < 1 || targetPage > totalPages.value || targetPage === page.value) return
+      page.value = targetPage
+      loadPage()
     }
     onBeforeUnmount(() => { if (leafletMap) leafletMap.remove() })
 
@@ -494,7 +497,7 @@ const App = {
     }
 
     async function removeDigestRule(rule) {
-      if (!window.confirm(`确定删除动态推送“${rule.name}”吗？历史运行和投递记录会保留。`)) return
+      if (!window.confirm(`确定删除动态推送”${rule.name}”吗？历史运行记录会保留。`)) return
       await perform(async () => {
         await api(`/notifications/digests/rules/${rule.id}`, { method: 'DELETE' })
         if (editingDigestRuleId.value === rule.id) resetDigestForm()
@@ -530,19 +533,6 @@ const App = {
       }).catch(() => {})
     }
 
-    async function openDelivery(id) {
-      await perform(async () => { data.selectedDelivery = await api(`/notifications/deliveries/${id}`) }).catch(() => {})
-    }
-
-    async function retryDelivery(id) {
-      await perform(async () => {
-        await api(`/notifications/deliveries/${id}/retry`, { method: 'POST' })
-        data.selectedDelivery = null
-        flash('失败批次已进入重试队列')
-        await loadPage()
-      }).catch(() => {})
-    }
-
     async function runMaintenance(kind, dryRun) {
       const labels = { attribution: '事件归属重验', chinadaily: '中国日报正文清理' }
       if (!dryRun && !window.confirm(`即将执行“${labels[kind]}”，会修改自动生成且未人工锁定的数据。确认已经完成 SQLite 备份并继续吗？`)) return
@@ -570,18 +560,18 @@ const App = {
     async function searchNow() { active.value = 'search'; await loadPage() }
 
     watch(() => [filters.person_id, filters.event_type, filters.confirmation_status, filters.start_date, filters.end_date, filters.sort_order, filters.location.join('|')], () => {
-      if (['timeline', 'map'].includes(active.value)) loadPage()
+      if (['timeline', 'map'].includes(active.value)) { page.value = 1; loadPage() }
     })
     onMounted(checkSession)
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      maintenance, emailForm, deliveryFilters, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, percent, visibleNav, manualSources,
+      maintenance, emailForm, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, visibleNav, manualSources, page, pageSize, totalPages, goToPage,
       digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestSourceSearch, visibleDigestSources, digestPreviewDate, digestRunFilters,
       login, logout, loadPage, selectPage, openEvent, deleteEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
       runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail,
       saveDigestRule, editDigestRule, resetDigestForm, selectAllDigestPersons, clearDigestPersons, selectAllDigestSources, clearDigestSources, previewDigestRule, toggleDigestRule, removeDigestRule, runDigestRule, openDigestRun, retryDigestBatch,
-      openDelivery, retryDelivery, savePermissions, searchNow
+      savePermissions, searchNow
     }
   },
   template: `
@@ -654,9 +644,20 @@ const App = {
           <div class="timeline">
             <article v-for="event in data.events" :key="event.id" :class="['timeline-card', event.event_type]" @click="openEvent(event.id)">
               <div class="timeline-date"><strong>{{ formatBeijing(event.start_at).split(' ')[0] }}</strong><span>{{ event.time_precision === 'unknown' ? '时间未知' : '北京时间' }}</span></div>
-              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span>可信度 {{ percent(event.confidence) }}</span><span>{{ event.source_names || '来源未知' }}</span><button v-if="user.role==='admin'" class="delete-link small" @click.stop="deleteEvent(event)">删除</button></footer></div>
+              <div class="timeline-body"><div class="card-meta"><span :class="['type',event.event_type]">{{ eventLabels[event.event_type] }}</span><span>{{ event.person_name }}</span><span>⌖ {{ event.location_name || '无地点' }}</span></div><h3>{{ event.title }}</h3><p>{{ event.summary }}</p><footer><span class="status">{{ statusLabels[event.confirmation_status] }}</span><span>{{ event.source_names || '来源未知' }}</span><button v-if="user.role==='admin'" class="delete-link small" @click.stop="deleteEvent(event)">删除</button></footer></div>
             </article>
             <p v-if="!data.events.length" class="empty">这个筛选条件下还没有事件。</p>
+          </div>
+          <div v-if="data.eventTotal > 0" class="pagination">
+            <div class="pagination-left">
+              <label>每页<select v-model.number="pageSize" @change="page=1;loadPage()"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option></select>条</label>
+            </div>
+            <div class="pagination-right">
+              <button :disabled="page <= 1" @click="goToPage(page - 1)">上一页</button>
+              <span class="page-info">第 {{ page }} / {{ totalPages }} 页</span>
+              <button :disabled="page >= totalPages" @click="goToPage(page + 1)">下一页</button>
+              <input v-model.number="page" type="number" :min="1" :max="totalPages" @keyup.enter="goToPage(page)" class="page-jump" title="跳转到页码" />
+            </div>
           </div>
         </template>
 
@@ -820,14 +821,6 @@ const App = {
             </tbody></table>
             <p v-if="!data.digestRuns.length" class="empty">暂无动态推送运行记录。</p>
           </section>
-
-          <section class="panel">
-            <div class="section-title"><h3>投递记录</h3><span>共 {{ data.deliveryTotal }} 批</span></div>
-            <div class="toolbar notification-toolbar"><select v-model="deliveryFilters.task_id"><option value="">全部任务</option><option v-for="task in data.notificationOptions.tasks" :value="task.id">{{ task.name }}</option></select><select v-model="deliveryFilters.delivery_status"><option value="">全部状态</option><option v-for="status in ['pending','sending','retrying','sent','failed','skipped']" :value="status">{{ status }}</option></select><button @click="loadPage">筛选</button></div>
-            <table><thead><tr><th>时间</th><th>任务</th><th>收件人</th><th>事件</th><th>状态/尝试</th><th>错误</th></tr></thead><tbody>
-              <tr v-for="delivery in data.deliveries" :key="delivery.id" @click="openDelivery(delivery.id)" class="clickable-row"><td>{{ formatBeijing(delivery.created_at) }}</td><td>{{ delivery.task_name }}<small>第 {{ delivery.part_number }} 部分</small></td><td>{{ delivery.recipient }}</td><td>{{ delivery.item_count }}</td><td><span class="status">{{ delivery.status }}</span> / {{ delivery.attempt_count }}</td><td class="delivery-error">{{ delivery.last_error || '—' }}</td></tr>
-            </tbody></table><p v-if="!data.deliveries.length" class="empty">暂无投递记录；规则只会作用于创建后的新任务运行。</p>
-          </section>
         </template>
 
         <template v-if="active === 'map'">
@@ -845,10 +838,9 @@ const App = {
         <template v-if="active === 'config'"><section class="panel"><div class="section-title"><h3>当前生效配置</h3><span>敏感字段已脱敏</span></div><pre>{{ JSON.stringify(data.config, null, 2) }}</pre></section></template>
         <template v-if="active === 'audit'"><section class="panel"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>结果</th><th>摘要</th></tr></thead><tbody><tr v-for="item in data.audit" :key="item.id"><td>{{ formatBeijing(item.created_at) }}</td><td>{{ item.username || '系统/未知' }}</td><td>{{ item.action }}</td><td>{{ item.object_type }} #{{ item.object_id }}</td><td>{{ item.result }}</td><td>{{ item.change_summary }}</td></tr></tbody></table></section></template>
 
-          <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div><div><small>可信度</small><strong>{{ percent(data.selectedEvent.confidence) }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="danger" @click="deleteEvent(data.selectedEvent)">删除事件</button></div></section></aside>
+          <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="danger" @click="deleteEvent(data.selectedEvent)">删除事件</button></div></section></aside>
           <aside v-if="data.selectedDigestRun" class="detail-overlay" @click.self="data.selectedDigestRun=null"><section class="detail-panel"><button class="close" @click="data.selectedDigestRun=null">×</button><p class="eyebrow">DYNAMIC PUSH</p><h2>{{ data.selectedDigestRun.rule_name }} · {{ data.selectedDigestRun.scheduled_date }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDigestRun.status }}</strong></div><div><small>触发方式</small><strong>{{ data.selectedDigestRun.trigger_type==='manual' ? '手工补跑' : '自动调度' }}</strong></div><div><small>窗口开始</small><strong>{{ formatBeijing(data.selectedDigestRun.window_start) }}</strong></div><div><small>窗口结束</small><strong>{{ formatBeijing(data.selectedDigestRun.window_end) }}</strong></div></div><p v-if="data.selectedDigestRun.error_summary" class="error">{{ data.selectedDigestRun.error_summary }}</p><h3>投递批次</h3><article class="evidence" v-for="batch in data.selectedDigestRun.batches" :key="batch.id"><div><strong>{{ batch.recipient }} · 第 {{ batch.part_number }} 部分</strong><span class="status">{{ batch.status }}</span></div><small>{{ batch.item_count }} 个事件 · 尝试 {{ batch.attempt_count }} 次 · {{ batch.last_error || '无错误' }}</small><button v-if="user.role==='admin' && batch.status==='failed'" class="primary small" @click="retryDigestBatch(batch.id)">重新投递</button></article><h3>时间线明细</h3><article class="evidence" v-for="item in data.selectedDigestRun.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ formatBeijing(item.start_at) }} · {{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article></section></aside>
-          <aside v-if="data.selectedDelivery" class="detail-overlay" @click.self="data.selectedDelivery=null"><section class="detail-panel"><button class="close" @click="data.selectedDelivery=null">×</button><p class="eyebrow">EMAIL DELIVERY</p><h2>{{ data.selectedDelivery.task_name }}</h2><div class="detail-facts"><div><small>状态</small><strong>{{ data.selectedDelivery.status }}</strong></div><div><small>收件人</small><strong>{{ data.selectedDelivery.recipient }}</strong></div><div><small>创建时间</small><strong>{{ formatBeijing(data.selectedDelivery.created_at) }}</strong></div><div><small>发送时间</small><strong>{{ formatBeijing(data.selectedDelivery.sent_at) }}</strong></div></div><p v-if="data.selectedDelivery.last_error" class="error">{{ data.selectedDelivery.last_error }}</p><h3>事件明细</h3><article class="evidence" v-for="item in data.selectedDelivery.items" :key="item.id"><div><strong>{{ item.person_name || '事件已删除' }} · {{ item.title || '#'+item.event_id }}</strong><span class="status">{{ item.status }}</span></div><small>{{ eventLabels[item.event_type] || item.event_type }} · {{ item.skip_reason || '正常' }}</small></article><button v-if="user.role==='admin' && data.selectedDelivery.status==='failed'" class="primary" @click="retryDelivery(data.selectedDelivery.id)">重新投递</button></section></aside>
-      </section>
+                </section>
     </div>
   `
 }

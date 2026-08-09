@@ -11,25 +11,28 @@ describe('email notification management UI', () => {
     expect(source).toContain("user.role==='admin'")
   })
 
-  it('supports effective config, test sending and delivery retry', () => {
+  it('supports effective config, test sending and digest delivery', () => {
     expect(source).toContain('/notifications/email/config')
     expect(source).toContain('/notifications/email/test')
     expect(source).toContain('/notifications/digests/rules')
-    expect(source).toContain('/notifications/deliveries/')
-    expect(source).toContain('retryDelivery')
-    expect(source).toContain('formatBeijing(delivery.created_at)')
+    expect(source).toContain('retryDigestBatch')
   })
 
-  it('no longer renders the retired push-rule and scheduled-incremental modules', () => {
+  it('no longer renders the retired push-rule, scheduled-incremental and delivery-records modules', () => {
     expect(source).not.toContain('/notifications/rules')
     expect(source).not.toContain('/notifications/incremental')
+    expect(source).not.toContain('/notifications/deliveries/')
     expect(source).not.toContain('新增推送规则')
     expect(source).not.toContain('推送规则</h3>')
     expect(source).not.toContain('定时增量运行')
+    expect(source).not.toContain('投递记录</h3>')
     expect(source).not.toContain('selectedIncrementalRun')
     expect(source).not.toContain('saveNotificationRule')
     expect(source).not.toContain('ruleForm')
     expect(source).not.toContain('incrementalRunFilters')
+    expect(source).not.toContain('openDelivery')
+    expect(source).not.toContain('retryDelivery')
+    expect(source).not.toContain('deliveryFilters')
   })
 
   it('provides responsive notification layout and status feedback', () => {
