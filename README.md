@@ -28,6 +28,7 @@
 - 密码：Python 标准库 scrypt 加盐哈希。
 - 会话：可撤销的数据库会话 + HttpOnly Cookie。
 - 采集：集中 WebFetch 服务负责 HTTP/Playwright、缓存、重试、限流与 SSRF；PFTS 负责 RSS 解析和业务入库。
+- 站点图标：浏览器 TAB 显示品牌 favicon（SVG/PNG/ICO）与 apple-touch-icon，资源位于 `src/app/frontend/public/`，随前端构建发布。
 
 系统默认使用本地规则抽取，因此不配置外部模型也可完整运行。设计细节见 [系统设计说明书](系统设计说明书.md)，需求边界见 [软件需求规格说明书](软件需求规格说明书.md)。
 
