@@ -74,6 +74,7 @@ const App = {
     const mapPersonId = ref('')
     const page = ref(1)
     const pageSize = ref(20)
+    const mobileMenuOpen = ref(false)
     let leafletMap = null
 
     const nav = [
@@ -141,7 +142,7 @@ const App = {
     }
 
     async function logout() {
-      try { await api('/auth/logout', { method: 'POST' }) } finally { user.value = null }
+      try { await api('/auth/logout', { method: 'POST' }) } finally { user.value = null; mobileMenuOpen.value = false }
     }
 
     async function loadCommon() {
@@ -230,7 +231,7 @@ const App = {
 
     async function reloadMap() { await loadPage(); await renderMap() }
     async function selectPage(key) {
-      active.value = key; data.selectedEvent = null
+      active.value = key; data.selectedEvent = null; mobileMenuOpen.value = false
       if (key === 'map') data.mapPeople = (await api('/map/people')).items
       await loadPage(); if (key === 'map') await renderMap()
     }
@@ -566,7 +567,7 @@ const App = {
 
     return {
       user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
-      maintenance, emailForm, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, visibleNav, manualSources, page, pageSize, totalPages, goToPage,
+      maintenance, emailForm, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, visibleNav, manualSources, page, pageSize, totalPages, goToPage, mobileMenuOpen,
       digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestSourceSearch, visibleDigestSources, digestPreviewDate, digestRunFilters,
       login, logout, loadPage, selectPage, openEvent, deleteEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
       runTask, runMaintenance, saveEmailConfig, resetEmailOverrides, testEmail,
@@ -591,13 +592,14 @@ const App = {
     </main>
 
     <div v-else class="app-shell">
-      <aside class="sidebar">
-        <div class="brand"><span>足</span><div><strong>人物足迹</strong><small>PFTS · 证据优先</small></div></div>
+      <button v-if="mobileMenuOpen" class="sidebar-backdrop" aria-label="关闭导航" @click="mobileMenuOpen=false"></button>
+      <aside id="primary-navigation" :class="['sidebar', { open: mobileMenuOpen }]">
+        <div class="brand"><span>足</span><div><strong>人物足迹</strong><small>PFTS · 证据优先</small></div><button class="sidebar-close" aria-label="关闭导航" @click="mobileMenuOpen=false">×</button></div>
         <nav><button v-for="item in visibleNav" :key="item[0]" :class="{ active: active === item[0] }" @click="selectPage(item[0])">{{ item[1] }}</button></nav>
         <div class="user-card"><small>当前用户</small><strong>{{ user.username }}</strong><span>{{ user.role === 'admin' ? '管理员' : '普通用户' }}</span><button @click="logout">退出</button></div>
       </aside>
       <section class="content">
-        <header><div><p class="eyebrow">LIVE RESEARCH DESK</p><h2>{{ visibleNav.find(v => v[0] === active)?.[1] }}</h2></div><div class="header-meta"><span class="live-dot"></span> 北京时间 · 数据可追溯</div></header>
+        <header><button class="mobile-menu-button" aria-label="打开导航" aria-controls="primary-navigation" :aria-expanded="mobileMenuOpen" @click="mobileMenuOpen=true"><span></span><span></span><span></span></button><div class="page-heading"><p class="eyebrow">LIVE RESEARCH DESK</p><h2>{{ visibleNav.find(v => v[0] === active)?.[1] }}</h2></div><div class="header-meta"><span class="live-dot"></span> 北京时间 · 数据可追溯</div></header>
         <p v-if="error" class="error banner">{{ error }} <button @click="error=''">×</button></p>
         <p v-if="notice" class="notice banner">{{ notice }}</p>
         <div v-if="loading" class="loading">正在读取数据…</div>
