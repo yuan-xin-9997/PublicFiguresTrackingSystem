@@ -7,15 +7,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Cookie, Depends, HTTPException, Request, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .database import Database
 
 
 ALL_PAGES = [
     "dashboard", "persons", "timeline", "map", "search", "sources",
-    "tasks", "notifications", "users", "config", "audit",
+    "tasks", "notifications", "users", "config", "audit", "ai_access",
 ]
-DEFAULT_USER_PAGES = ["dashboard", "persons", "timeline", "map", "search"]
+DEFAULT_USER_PAGES = ["dashboard", "persons", "timeline", "map", "search", "ai_access"]
 
 
 def utc_now() -> str:
@@ -127,7 +128,10 @@ def user_pages(db: Database, user: Dict[str, Any]) -> List[str]:
     return [row["page_key"] for row in rows if row["page_key"] in ALL_PAGES]
 
 
-def current_user(request: Request, pfts_session: Optional[str] = Cookie(default=None)) -> Dict[str, Any]:
+def current_user(request: Request, pfts_session: Optional[str] = Cookie(default=None), machine_credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))) -> Dict[str, Any]:
+    if "authorization" in request.headers:
+        from .ai_access import machine_user
+        return machine_user(request)
     if not pfts_session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
     user = get_session_user(request.app.state.db, pfts_session)

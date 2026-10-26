@@ -386,8 +386,10 @@ class Database:
         return connection
 
     def initialize(self) -> None:
+        from .ai_schema import AI_SCHEMA
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            connection.executescript(AI_SCHEMA)
             event_sql_row = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='timeline_events'"
             ).fetchone()

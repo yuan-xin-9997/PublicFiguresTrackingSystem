@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 from .collectors import _article_rejection_reason, collect_source
@@ -215,6 +216,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     async def lifespan(application: FastAPI):
         db.initialize()
         sync_users(db, settings.path("security", "password_file"))
+        application.state.ai_worker.start()
         notification_holder["instance"] = NotificationWorker(db, settings)
         notification_holder["instance"].start()
         digest_scheduler_holder["instance"] = DailyDigestScheduler(db, settings)
@@ -222,7 +224,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if settings.get("tasks", "scheduler_enabled", False):
             scheduler_holder["instance"] = Scheduler(db, settings)
             scheduler_holder["instance"].start()
-        yield
+        async with application.state.ai_mcp_app.router.lifespan_context(application.state.ai_mcp_app):
+            yield
+        application.state.ai_worker.stop()
         if scheduler_holder["instance"]:
             scheduler_holder["instance"].stop()
         if digest_scheduler_holder["instance"]:
@@ -233,6 +237,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     application = FastAPI(title=settings.get("app", "name"), version="1.0.0", lifespan=lifespan)
     application.state.db = db
     application.state.settings = settings
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "VALIDATION_ERROR", "message": "请求参数不符合接口结构", "fields": [list(e['loc']) for e in exc.errors()]}})
 
     @application.middleware("http")
     async def request_context(request: Request, call_next):
@@ -344,7 +352,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         return person
 
     @application.get("/api/v1/persons")
-    def list_persons(q: str = "", user: Dict[str, Any] = Depends(require_page("persons"))):
+    def list_persons(q: str = Query('', max_length=200), page: Optional[int] = Query(None, ge=1), page_size: int = Query(20, ge=1, le=200), user: Dict[str, Any] = Depends(require_page("persons"))):
         params: List[Any] = []
         where = "WHERE p.deleted_at IS NULL"
         if q:
@@ -355,7 +363,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         )
         for item in items:
             item["aliases"] = [row["alias"] for row in db.fetch_all("SELECT alias FROM person_aliases WHERE person_id=? AND enabled=1", (item["id"],))]
-        return {"items": items, "total": len(items)}
+        total = len(items)
+        if 'credential_id' in user:
+            page = page or 1
+        if page is not None:
+            items = items[(page - 1) * page_size:page * page_size]
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     @application.get("/api/v1/persons/{person_id}")
     def get_person(person_id: int, user: Dict[str, Any] = Depends(require_page("persons"))):
@@ -407,7 +420,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         return {"ok": True, "id": person_id, "deleted_at": now}
 
     @application.get("/api/v1/sources")
-    def list_sources(user: Dict[str, Any] = Depends(require_page("sources"))):
+    def list_sources(page: Optional[int] = Query(None, ge=1), page_size: int = Query(20, ge=1, le=200), user: Dict[str, Any] = Depends(require_page("sources"))):
         items = db.fetch_all(
             "SELECT s.*,(SELECT COUNT(*) FROM raw_documents d WHERE d.source_id=s.id) document_count "
             "FROM information_sources s WHERE s.deleted_at IS NULL ORDER BY s.id DESC"
@@ -422,7 +435,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             item["discovery_max_pages"] = int(parser.get("discovery_max_pages", 12))
             item["discovery_max_depth"] = int(parser.get("discovery_max_depth", 1))
             item["display_type"] = "website" if item["discovery_enabled"] else item["type"]
-        return {"items": items, "total": len(items)}
+        total = len(items)
+        if 'credential_id' in user:
+            page = page or 1
+        if page is not None:
+            items = items[(page - 1) * page_size:page * page_size]
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     def _validate_source(values: Dict[str, Any]) -> None:
         if values["type"] not in {"rss", "web_page", "website", "manual"}:
@@ -508,12 +526,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(400, "来源测试失败：{}".format(str(exc)[:300]))
 
     @application.get("/api/v1/tasks")
-    def list_tasks(user: Dict[str, Any] = Depends(require_page("tasks"))):
+    def list_tasks(page: Optional[int] = Query(None, ge=1), page_size: int = Query(20, ge=1, le=200), user: Dict[str, Any] = Depends(require_page("tasks"))):
         items = db.fetch_all(
             "SELECT t.*,s.name AS source_name,(SELECT status FROM task_runs r WHERE r.task_id=t.id ORDER BY r.id DESC LIMIT 1) last_status "
             "FROM collection_tasks t JOIN information_sources s ON s.id=t.source_id ORDER BY t.id DESC"
         )
-        return {"items": items, "total": len(items)}
+        total = len(items)
+        if 'credential_id' in user:
+            page = page or 1
+        if page is not None:
+            items = items[(page - 1) * page_size:page * page_size]
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     @application.post("/api/v1/tasks", status_code=201)
     def create_task(body: TaskBody, request: Request, user: Dict[str, Any] = Depends(require_admin)):
@@ -682,21 +705,19 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         return {"ok": True, "id": event_id}
 
     @application.get("/api/v1/search")
-    def search(q: str = Query(min_length=1, max_length=200), page_size: int = Query(30, ge=1, le=100), user: Dict[str, Any] = Depends(require_page("search"))):
+    def search(q: str = Query(min_length=1, max_length=200), page_size: int = Query(30, ge=1, le=100), page: int = Query(1, ge=1), user: Dict[str, Any] = Depends(require_page("search"))):
         term = "%" + q + "%"
-        events = db.fetch_all(
+        sql = (
             "SELECT e.id,'event' result_type,e.title,e.summary,e.start_at,p.name AS person_name FROM timeline_events e "
             "JOIN public_figures p ON p.id=e.person_id WHERE e.review_status!='rejected' "
-            "AND (e.title LIKE ? OR e.summary LIKE ? OR e.quote_text LIKE ? OR e.location_name LIKE ? OR p.name LIKE ?) LIMIT ?",
-            (term, term, term, term, term, page_size),
+            "AND (e.title LIKE ? OR e.summary LIKE ? OR e.quote_text LIKE ? OR e.location_name LIKE ? OR p.name LIKE ?) "
+            "UNION ALL SELECT d.id,'document' result_type,d.title,substr(d.content_text,1,300) summary,d.published_at start_at,s.name person_name "
+            "FROM raw_documents d JOIN information_sources s ON s.id=d.source_id WHERE d.title LIKE ? OR d.content_text LIKE ?"
         )
-        remaining = max(0, page_size - len(events))
-        docs = db.fetch_all(
-            "SELECT d.id,'document' result_type,d.title,substr(d.content_text,1,300) summary,d.published_at start_at,s.name person_name "
-            "FROM raw_documents d JOIN information_sources s ON s.id=d.source_id WHERE d.title LIKE ? OR d.content_text LIKE ? LIMIT ?",
-            (term, term, remaining),
-        ) if remaining else []
-        return {"items": events + docs, "total": len(events) + len(docs)}
+        params = [term] * 7
+        total = db.fetch_one("SELECT COUNT(*) n FROM (" + sql + ")", params)["n"]
+        items = db.fetch_all("SELECT * FROM (" + sql + ") ORDER BY result_type DESC,id DESC LIMIT ? OFFSET ?", params + [page_size, (page - 1) * page_size])
+        return _list_response(items, total, page, page_size)
 
     @application.get("/api/v1/users")
     def list_users(user: Dict[str, Any] = Depends(require_admin)):
@@ -1176,6 +1197,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         )
         result["deleted"] = True
         return result
+
+    from .ai_access import install_ai
+    install_ai(application)
+    from .ai_openapi import install_openapi
+    install_openapi(application)
 
     frontend_dist = settings.src_root / "app" / "frontend" / "dist"
     if frontend_dist.exists():

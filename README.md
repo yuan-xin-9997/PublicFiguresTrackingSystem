@@ -341,3 +341,12 @@ Jenkins 任务应选择 “Pipeline script from SCM”，使用 SSH 仓库地址
 ## 许可证
 
 见 [LICENSE](LICENSE)。
+
+
+## AI 接入（API / MCP）
+
+在现有「系统配置」中进入「AI 接入」，管理本人机器凭据。支持名称、有效期、最小权限选择、一次性密钥显示、分页列表和确认撤销；原网页登录与页面权限继续生效。核心业务使用版本化 `/api/v1`，机器 OAuth 令牌端点为 `/oauth/token`，官方 SDK 2.3.0 的 Streamable HTTP MCP 入口为 `/mcp/`。API 和 MCP 令牌按目标资源隔离，所属用户停用或权限降低即时约束已签发令牌。
+
+完整地址、工具、权限、自动续取客户端、配置、迁移与回滚见 [AI 接入指南](AI接入指南.md)。仅支持机器 OAuth client_credentials；交互授权码客户端未提供支持。测试命令：`python -m pytest src/tests -q`；实际网络验证：设置 PFTS_SMOKE_URL、PFTS_SMOKE_USER、PFTS_SMOKE_PASSWORD 后运行 `python src/tests/smoke_ai_live.py`。
+
+部署流水线先测试、构建并准备依赖，再通过 systemd 安全停服、备份 SQLite 数据、保留当前 config/app.json 更新代码并复核。真实浏览器操作验证目前受电脑操作工具限制，尚未完成，详见指南的验证边界。

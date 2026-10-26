@@ -19,6 +19,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "login_window_seconds": 300,
     },
     "tasks": {"scheduler_enabled": False, "poll_seconds": 30, "max_items_per_run": 50},
+    "ai_access": {"token_seconds": 600, "requests_per_minute": 120, "max_body_bytes": 524288},
     "collector": {
         "provider": "webfetch",
         "webfetch_base_url": "",

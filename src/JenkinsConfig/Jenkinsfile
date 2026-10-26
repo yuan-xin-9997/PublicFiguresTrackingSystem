@@ -1,7 +1,7 @@
 pipeline {
     agent any
     options { timestamps(); disableConcurrentBuilds() }
-    triggers { pollSCM('H/3 * * * *') }
+    triggers { pollSCM('H/30 * * * *') }
     environment {
         APP_NAME = 'PublicFiguresTrackingSystem'
         DEPLOY_DIR = '/opt/PublicFiguresTrackingSystem'
@@ -34,16 +34,40 @@ pipeline {
                 sh 'npx --yes @fission-ai/openspec@1.6.0 validate --all --strict'
             }
         }
+        stage('Prepare release and backup') {
+            steps {
+                sh '''
+                    python3 -m venv .release-venv
+                    .release-venv/bin/python -m pip install -r src/requirements.txt
+                    .release-venv/bin/python -m pip check
+                    if [ -d "$DEPLOY_DIR/app" ]; then
+                        BACKUP="$DEPLOY_DIR/data/backups/$(date +%Y/%m/%d)/build-$BUILD_NUMBER"
+                        mkdir -p "$BACKUP"
+                        tar -czf "$BACKUP/code.tar.gz" -C "$DEPLOY_DIR" app requirements.txt JenkinsConfig start.sh stop.sh status.sh
+                        cp "$DEPLOY_DIR/config/app.json" "$BACKUP/app.json"
+                        printf '%s' "$BACKUP" > .backup-path
+                    fi
+                '''
+            }
+        }
         stage('Stop current service') {
             steps {
-                sh 'if [ -x "$DEPLOY_DIR/stop.sh" ]; then "$DEPLOY_DIR/stop.sh"; fi'
+                sh '''
+                    if systemctl cat pfts.service >/dev/null 2>&1; then
+                        sudo -n /usr/bin/systemctl stop pfts.service
+                    elif [ -x "$DEPLOY_DIR/stop.sh" ]; then "$DEPLOY_DIR/stop.sh"; fi
+                    if [ -f .backup-path ]; then
+                        .release-venv/bin/python src/JenkinsConfig/backup_database.py "$DEPLOY_DIR/data/app.sqlite3" "$(cat .backup-path)/app.sqlite3"
+                    fi
+                '''
             }
         }
         stage('Update deployment') {
             steps {
                 sh '''
                     mkdir -p "$DEPLOY_DIR"
-                    rsync -a --delete --exclude data --exclude logs --exclude config/app.json --exclude .venv --exclude .ci-venv --exclude .pytest_cache src/ "$DEPLOY_DIR/"
+                    rsync -a --delete --exclude data --exclude logs --exclude config/app.json --exclude .venv --exclude .ci-venv --exclude .pytest_cache --exclude app/frontend/node_modules src/ "$DEPLOY_DIR/"
+                    rsync -a --delete .release-venv/ "$DEPLOY_DIR/.venv/"
                     mkdir -p "$DEPLOY_DIR/config" "$DEPLOY_DIR/data" "$DEPLOY_DIR/logs"
                     if [ ! -f "$DEPLOY_DIR/config/app.json" ]; then cp src/config/app.json "$DEPLOY_DIR/config/app.json"; fi
                     if [ ! -f "$DEPLOY_DIR/data/password.txt" ]; then cp src/data/password.txt "$DEPLOY_DIR/data/password.txt"; fi
@@ -54,9 +78,13 @@ pipeline {
         stage('Start and smoke test') {
             steps {
                 sh '''
-                    JENKINS_NODE_COOKIE=dontKillMe "$DEPLOY_DIR/start.sh"
+                    if systemctl cat pfts.service >/dev/null 2>&1; then
+                        sudo -n /usr/bin/systemctl start pfts.service
+                    else
+                        JENKINS_NODE_COOKIE=dontKillMe "$DEPLOY_DIR/start.sh"
+                    fi
                     sleep 3
-                    "$DEPLOY_DIR/status.sh"
+                    if systemctl cat pfts.service >/dev/null 2>&1; then systemctl is-active pfts.service; else "$DEPLOY_DIR/status.sh"; fi
                     curl -fsS http://127.0.0.1:28000/api/v1/health/ready
                     SMOKE_USER=$(awk -F: '$3 == "admin" { print $1; exit }' "$DEPLOY_DIR/data/password.txt")
                     SMOKE_PASSWORD=$(awk -F: '$3 == "admin" { print $2; exit }' "$DEPLOY_DIR/data/password.txt")
@@ -64,6 +92,8 @@ pipeline {
                     test -n "$SMOKE_PASSWORD"
                     PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
                         "$DEPLOY_DIR/.venv/bin/python" "$DEPLOY_DIR/tests/smoke_live.py"
+                    PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
+                        "$DEPLOY_DIR/.venv/bin/python" "$DEPLOY_DIR/tests/smoke_ai_live.py"
                     unset SMOKE_USER SMOKE_PASSWORD
                 '''
             }

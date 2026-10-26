@@ -24,7 +24,7 @@ class Scheduler:
     def stop(self) -> None:
         self.stop_event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=5)
+            self.thread.join()  # Finish the active collection before deployment stops the process.
 
     def _loop(self) -> None:
         poll = max(5, int(self.settings.get("tasks", "poll_seconds", 30)))

@@ -5,6 +5,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { eventLabels, formatBeijing, locationFilterLabel, queryString, statusLabels } from './utils.js'
 import './styles.css'
+import { AiAccess } from './AiAccess.js'
 
 const API = '/api/v1'
 
@@ -24,9 +25,12 @@ async function api(path, options = {}) {
 }
 
 const App = {
+  components: { AiAccess },
   setup() {
     const user = ref(null)
     const active = ref('dashboard')
+    const aiSecretOpen = ref(false)
+    const appVersion = __APP_VERSION__
     const loading = ref(false)
     const error = ref('')
     const notice = ref('')
@@ -80,7 +84,7 @@ const App = {
     const nav = [
       ['dashboard', '总览'], ['timeline', '时间线'], ['persons', '人物'], ['map', '地图'], ['search', '搜索'],
       ['sources', '信息源'], ['tasks', '任务中心'], ['notifications', '推送管理'], ['users', '用户权限'],
-      ['config', '系统配置'], ['audit', '审计日志']
+      ['config', '系统配置'], ['ai_access', 'AI 接入'], ['audit', '审计日志']
     ]
     const visibleNav = computed(() => nav.filter(([key]) => user.value?.pages?.includes(key)))
     const manualSources = computed(() => data.sources.filter(source => source.type === 'manual'))
@@ -142,7 +146,7 @@ const App = {
     }
 
     async function logout() {
-      try { await api('/auth/logout', { method: 'POST' }) } finally { user.value = null; mobileMenuOpen.value = false }
+      try { await api('/auth/logout', { method: 'POST' }) } finally { user.value = null; mobileMenuOpen.value = false; aiSecretOpen.value = false }
     }
 
     async function loadCommon() {
@@ -231,6 +235,7 @@ const App = {
 
     async function reloadMap() { await loadPage(); await renderMap() }
     async function selectPage(key) {
+      if (aiSecretOpen.value) { window.alert('请先保存一次性密钥并关闭凭据窗口。'); return }
       active.value = key; data.selectedEvent = null; mobileMenuOpen.value = false
       if (key === 'map') data.mapPeople = (await api('/map/people')).items
       await loadPage(); if (key === 'map') await renderMap()
@@ -566,7 +571,7 @@ const App = {
     onMounted(checkSession)
 
     return {
-      user, active, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
+      user, active, aiSecretOpen, appVersion, loading, error, notice, data, filters, loginForm, personForm, editingPersonId, sourceForm, editingSourceId, documentForm,
       maintenance, emailForm, searchTerm, mapEl, mapPersonId, reloadMap, eventLabels, statusLabels, formatBeijing, locationFilterLabel, visibleNav, manualSources, page, pageSize, totalPages, goToPage, mobileMenuOpen,
       digestForm, editingDigestRuleId, digestPersonSearch, visibleDigestPersons, digestSourceSearch, visibleDigestSources, digestPreviewDate, digestRunFilters,
       login, logout, loadPage, selectPage, openEvent, deleteEvent, savePerson, startEditPerson, resetPersonForm, deletePerson, saveSource, startEditSource, resetSourceForm, deleteSource, testSource, addDocument,
@@ -596,7 +601,7 @@ const App = {
       <aside id="primary-navigation" :class="['sidebar', { open: mobileMenuOpen }]">
         <div class="brand"><span>足</span><div><strong>人物足迹</strong><small>PFTS · 证据优先</small></div><button class="sidebar-close" aria-label="关闭导航" @click="mobileMenuOpen=false">×</button></div>
         <nav><button v-for="item in visibleNav" :key="item[0]" :class="{ active: active === item[0] }" @click="selectPage(item[0])">{{ item[1] }}</button></nav>
-        <div class="user-card"><small>当前用户</small><strong>{{ user.username }}</strong><span>{{ user.role === 'admin' ? '管理员' : '普通用户' }}</span><button @click="logout">退出</button></div>
+        <div class="user-card"><small>当前用户</small><strong>{{ user.username }}</strong><span>{{ user.role === 'admin' ? '管理员' : '普通用户' }}</span><small>版本 {{ appVersion }}</small><button @click="logout">退出</button></div>
       </aside>
       <section class="content">
         <header><button class="mobile-menu-button" aria-label="打开导航" aria-controls="primary-navigation" :aria-expanded="mobileMenuOpen" @click="mobileMenuOpen=true"><span></span><span></span><span></span></button><div class="page-heading"><p class="eyebrow">LIVE RESEARCH DESK</p><h2>{{ visibleNav.find(v => v[0] === active)?.[1] }}</h2></div><div class="header-meta"><span class="live-dot"></span> 北京时间 · 数据可追溯</div></header>
@@ -837,7 +842,8 @@ const App = {
           <section class="panel"><div class="section-title"><h3>用户与页面权限</h3><span>用户账号来自 data/password.txt</span></div><div class="permission-card" v-for="target in data.users" :key="target.id"><div><strong>{{ target.username }}</strong><span>{{ target.role }}</span><small>最近登录：{{ formatBeijing(target.last_login_at) }}</small></div><div class="checks"><label v-for="page in data.allPages"><input type="checkbox" :value="page" v-model="target.pages" :disabled="target.role==='admin'" />{{ page }}</label></div><button @click="savePermissions(target)" :disabled="target.role==='admin'">保存</button></div></section>
         </template>
 
-        <template v-if="active === 'config'"><section class="panel"><div class="section-title"><h3>当前生效配置</h3><span>敏感字段已脱敏</span></div><pre>{{ JSON.stringify(data.config, null, 2) }}</pre></section></template>
+        <template v-if="active === 'config'"><section class="panel"><div class="section-title"><h3>当前生效配置</h3><button v-if="user.pages.includes('ai_access')" @click="selectPage('ai_access')">AI 接入</button></div><pre>{{ JSON.stringify(data.config, null, 2) }}</pre></section></template>
+        <AiAccess v-if="active === 'ai_access'" @secret-open="aiSecretOpen=$event" />
         <template v-if="active === 'audit'"><section class="panel"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>结果</th><th>摘要</th></tr></thead><tbody><tr v-for="item in data.audit" :key="item.id"><td>{{ formatBeijing(item.created_at) }}</td><td>{{ item.username || '系统/未知' }}</td><td>{{ item.action }}</td><td>{{ item.object_type }} #{{ item.object_id }}</td><td>{{ item.result }}</td><td>{{ item.change_summary }}</td></tr></tbody></table></section></template>
 
           <aside v-if="data.selectedEvent" class="detail-overlay" @click.self="data.selectedEvent=null"><section class="detail-panel"><button class="close" @click="data.selectedEvent=null">×</button><div class="card-meta"><span :class="['type',data.selectedEvent.event_type]">{{ eventLabels[data.selectedEvent.event_type] }}</span><span>{{ data.selectedEvent.person_name }}</span></div><h2>{{ data.selectedEvent.title }}</h2><p class="lead">{{ data.selectedEvent.summary }}</p><div class="detail-facts"><div><small>发生时间</small><strong>{{ formatBeijing(data.selectedEvent.start_at) }}</strong></div><div><small>地点</small><strong>{{ data.selectedEvent.location_name || '无地点' }}</strong></div><div><small>确认状态</small><strong>{{ statusLabels[data.selectedEvent.confirmation_status] }}</strong></div></div><blockquote v-if="data.selectedEvent.quote_text">“{{ data.selectedEvent.quote_text }}”</blockquote><h3>证据链</h3><article class="evidence" v-for="ev in data.selectedEvent.evidence" :key="ev.id"><div><strong>{{ ev.source_name }}</strong><a v-if="ev.canonical_url.startsWith('http')" :href="ev.canonical_url" target="_blank" rel="noreferrer">查看原文 ↗</a></div><p>{{ ev.evidence_text }}</p><small>{{ ev.document_title }} · {{ formatBeijing(ev.published_at || ev.collected_at) }} · 来源等级 {{ ev.trust_level }}/5</small></article><div v-if="user.role==='admin'" class="review-actions"><button class="danger" @click="deleteEvent(data.selectedEvent)">删除事件</button></div></section></aside>
