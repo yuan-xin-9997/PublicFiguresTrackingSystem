@@ -374,7 +374,7 @@ def install_ai(app):
             raise ToolError('须先确认完整替换人物资料；未提供字段将重置为默认值')
         return await call('PUT', f'/api/v1/persons/{person_id}', body={'name': name, 'organization': organization, 'aliases': aliases or []}, key=idempotency_key, confirm_replace=True)
 
-    @server.tool(annotations=write)
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
     async def submit_task(kind: Literal['collection', 'reanalyze'], target_id: int, idempotency_key: str) -> dict:
         """异步采集或重分析，返回任务 ID；分别需要 tasks:execute / documents:analyze 和管理员身份。"""
         return await call('POST', '/api/v1/ai/jobs', body={'kind': kind, 'target_id': target_id}, key=idempotency_key)

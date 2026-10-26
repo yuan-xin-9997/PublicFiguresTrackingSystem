@@ -65,7 +65,7 @@ async def main():
     async with httpx2.AsyncClient(auth=provider, trust_env=False, follow_redirects=True) as http:
         async with streamable_http_client(base + '/mcp/', http_client=http) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
+                await session.discover()  # MCP 2026-07-28; legacy initialize is covered in smoke tests.
                 tools = await session.list_tools()
                 print('tools:', ', '.join(t.name for t in tools.tools))
                 result = await session.call_tool('list_persons', {'page': 1, 'page_size': 5})

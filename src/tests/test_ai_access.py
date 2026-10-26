@@ -175,9 +175,19 @@ def test_real_mcp_sdk_client(admin_client):
                     assert not query.is_error, query
                     write = await session.call_tool('create_person', {'name': 'SDK created', 'idempotency_key': 'sdk-create-001'})
                     assert not write.is_error, write
+                    payload = write.structured_content or json.loads(write.content[0].text)
+                    assert isinstance(payload['id'], int)
                     repeat = await session.call_tool('create_person', {'name': 'SDK created', 'idempotency_key': 'sdk-create-001'})
                     assert not repeat.is_error
+                    assert (repeat.structured_content or json.loads(repeat.content[0].text))['id'] == payload['id']
                     bad = await session.call_tool('get_person', {'person_id': 999999})
                     assert bad.is_error
+            async with streamable_http_client('http://testserver/mcp/', http_client=http) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.discover()
+                    assert session.protocol_version == '2026-07-28'
+                    assert len((await session.list_tools()).tools) == 11
+                    assert not (await session.call_tool('list_persons', {'page_size': 2})).is_error
+                    assert not (await session.call_tool('create_person', {'name': 'SDK created', 'idempotency_key': 'sdk-create-001'})).is_error
     asyncio.run(run())
     assert len(c.app.state.db.fetch_all("SELECT id FROM public_figures WHERE name='SDK created'")) == 1

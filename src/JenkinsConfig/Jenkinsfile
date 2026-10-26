@@ -86,20 +86,22 @@ pipeline {
                     sleep 3
                     if systemctl cat pfts.service >/dev/null 2>&1; then systemctl is-active pfts.service; else "$DEPLOY_DIR/status.sh"; fi
                     curl -fsS http://127.0.0.1:28000/api/v1/health/ready
+                    set +x
                     SMOKE_USER=$(awk -F: '$3 == "admin" { print $1; exit }' "$DEPLOY_DIR/data/password.txt")
                     SMOKE_PASSWORD=$(awk -F: '$3 == "admin" { print $2; exit }' "$DEPLOY_DIR/data/password.txt")
                     test -n "$SMOKE_USER"
                     test -n "$SMOKE_PASSWORD"
                     PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
                         "$DEPLOY_DIR/.venv/bin/python" "$DEPLOY_DIR/tests/smoke_live.py"
-                    PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
+                    PFTS_SMOKE_SCAN_LOCAL=1 PFTS_SMOKE_USER="$SMOKE_USER" PFTS_SMOKE_PASSWORD="$SMOKE_PASSWORD" \
                         "$DEPLOY_DIR/.venv/bin/python" "$DEPLOY_DIR/tests/smoke_ai_live.py"
                     unset SMOKE_USER SMOKE_PASSWORD
+                    set -x
                 '''
             }
         }
     }
     post {
-        failure { sh 'if [ -f "$DEPLOY_DIR/logs/server.stderr.log" ]; then tail -n 100 "$DEPLOY_DIR/logs/server.stderr.log"; fi' }
+        failure { sh 'if systemctl cat pfts.service >/dev/null 2>&1; then systemctl status pfts.service --no-pager || true; elif [ -f "$DEPLOY_DIR/logs/server.stderr.log" ]; then tail -n 100 "$DEPLOY_DIR/logs/server.stderr.log"; fi' }
     }
 }
