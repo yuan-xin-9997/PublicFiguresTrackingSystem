@@ -8,6 +8,8 @@
 
 实际地址以 AI 接入页显示为准。部署保持原监听地址、端口和网络边界。
 
+现有 HTTPS 访问地址为 `https://persontracking.yuan-xin.top/`，API 为 `https://persontracking.yuan-xin.top/api/v1`，MCP 为 `https://persontracking.yuan-xin.top/mcp/`。反向代理部署必须配置 `server.base_url` 或 `PFTS_SERVER__BASE_URL` 为已有 HTTPS 地址，避免代理内部 HTTP 协议影响 OAuth issuer/resource。当前通过 systemd 环境配置注入，不覆盖 app.json。
+
 | 入口 | 路径 |
 |---|---|
 | 网页 | `/`，原登录与布局 |

@@ -242,7 +242,10 @@ def install_ai(app):
         user = db.fetch_one('SELECT * FROM users WHERE id=? AND enabled=1', (row['user_id'],))
         if not user or 'ai_access' not in user_pages(db, user):
             raise HTTPException(401, 'invalid_client')
-        form = parse_qs((await request.body()).decode(), keep_blank_values=True)
+        try:
+            form = parse_qs((await request.body()).decode(), keep_blank_values=True)
+        except UnicodeError:
+            raise HTTPException(400, 'invalid_request')
         if form.get('grant_type') != ['client_credentials']:
             raise HTTPException(400, 'unsupported_grant_type')
         resource = form.get('resource', [''])[0]
@@ -423,7 +426,7 @@ def install_ai(app):
                             'list_events': 'events:read', 'get_event': 'events:read',
                             'search_public_information': 'search:read', 'list_sources': 'sources:read',
                             'list_tasks': 'tasks:read', 'create_person': 'persons:write', 'update_person': 'persons:write'}
-                        scope = tool_scope.get(params.get('name'))
+                        scope = tool_scope.get(params.get('name')) if isinstance(params.get('name'), str) else None
                         if params.get('name') == 'submit_task':
                             arguments = params.get('arguments') if isinstance(params.get('arguments'), dict) else {}
                             scope = 'tasks:execute' if arguments.get('kind') == 'collection' else 'documents:analyze'
